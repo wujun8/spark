@@ -34,8 +34,7 @@ import scala.util.{Failure, Random, Success, Try}
 import scala.util.control.NonFatal
 
 import com.codahale.metrics.{MetricRegistry, MetricSet}
-import com.github.benmanes.caffeine.cache.Caffeine
-import org.apache.commons.io.IOUtils
+import com.google.common.cache.CacheBuilder
 
 import org.apache.spark._
 import org.apache.spark.errors.SparkCoreErrors
@@ -52,7 +51,7 @@ import org.apache.spark.network.netty.SparkTransportConf
 import org.apache.spark.network.shuffle._
 import org.apache.spark.network.shuffle.checksum.{Cause, ShuffleChecksumHelper}
 import org.apache.spark.network.shuffle.protocol.ExecutorShuffleInfo
-import org.apache.spark.network.util.TransportConf
+import org.apache.spark.network.util.{JavaUtils, TransportConf}
 import org.apache.spark.rpc.RpcEnv
 import org.apache.spark.scheduler.ExecutorCacheTaskLocation
 import org.apache.spark.serializer.{SerializerInstance, SerializerManager}
@@ -124,7 +123,7 @@ private[spark] class HostLocalDirManager(
     blockStoreClient: BlockStoreClient) extends Logging {
 
   private val executorIdToLocalDirsCache =
-    Caffeine
+    CacheBuilder
       .newBuilder()
       .maximumSize(cacheSize)
       .build[String, Array[String]]()
@@ -342,7 +341,7 @@ private[spark] class BlockManager(
             false
         }
       } finally {
-        IOUtils.closeQuietly(inputStream)
+        JavaUtils.closeQuietly(inputStream)
       }
     }
 
