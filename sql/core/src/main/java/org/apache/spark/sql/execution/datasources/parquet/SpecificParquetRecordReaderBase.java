@@ -23,7 +23,6 @@ import java.io.IOException;
 import java.lang.reflect.InvocationTargetException;
 import java.util.Collections;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -47,6 +46,7 @@ import org.apache.parquet.hadoop.ParquetFileReader;
 import org.apache.parquet.hadoop.ParquetInputFormat;
 import org.apache.parquet.hadoop.api.InitContext;
 import org.apache.parquet.hadoop.api.ReadSupport;
+import org.apache.parquet.hadoop.metadata.ParquetMetadata;
 import org.apache.parquet.hadoop.util.ConfigurationUtil;
 import org.apache.parquet.hadoop.util.HadoopInputFile;
 import org.apache.parquet.schema.MessageType;
@@ -89,17 +89,27 @@ public abstract class SpecificParquetRecordReaderBase<T> extends RecordReader<Vo
   @Override
   public void initialize(InputSplit inputSplit, TaskAttemptContext taskAttemptContext)
       throws IOException, InterruptedException {
+    initialize(inputSplit, taskAttemptContext, Option.empty());
+  }
+
+  public void initialize(
+      InputSplit inputSplit,
+      TaskAttemptContext taskAttemptContext,
+      Option<ParquetMetadata> fileFooter) throws IOException, InterruptedException {
     Configuration configuration = taskAttemptContext.getConfiguration();
     FileSplit split = (FileSplit) inputSplit;
     this.file = split.getPath();
-
-    ParquetReadOptions options = HadoopReadOptions
-      .builder(configuration, file)
-      .withRange(split.getStart(), split.getStart() + split.getLength())
-      .withCodecFactory(new ParquetCodecFactory(configuration, 0))
-      .build();
-    ParquetFileReader fileReader = new ParquetFileReader(
-        HadoopInputFile.fromPath(file, configuration), options);
+    ParquetFileReader fileReader;
+    if (fileFooter.isDefined()) {
+      fileReader = new ParquetFileReader(configuration, file, fileFooter.get());
+    } else {
+      ParquetReadOptions options = HadoopReadOptions
+          .builder(configuration, file)
+          .withRange(split.getStart(), split.getStart() + split.getLength())
+          .build();
+      fileReader = new ParquetFileReader(
+          HadoopInputFile.fromPath(file, configuration), options);
+    }
     this.reader = new ParquetRowGroupReaderImpl(fileReader);
     this.fileSchema = fileReader.getFileMetaData().getSchema();
     try {
@@ -129,12 +139,15 @@ public abstract class SpecificParquetRecordReaderBase<T> extends RecordReader<Vo
     // in test case.
     TaskContext taskContext = TaskContext$.MODULE$.get();
     if (taskContext != null) {
-      Option<AccumulatorV2<?, ?>> accu = taskContext.taskMetrics().externalAccums().lastOption();
-      if (accu.isDefined() && accu.get().getClass().getSimpleName().equals("NumRowGroupsAcc")) {
-        @SuppressWarnings("unchecked")
-        AccumulatorV2<Integer, Integer> intAccum = (AccumulatorV2<Integer, Integer>) accu.get();
-        intAccum.add(fileReader.getRowGroups().size());
-      }
+      taskContext.taskMetrics().withExternalAccums((accums) -> {
+        Option<AccumulatorV2<?, ?>> accu = accums.lastOption();
+        if (accu.isDefined() && accu.get().getClass().getSimpleName().equals("NumRowGroupsAcc")) {
+          @SuppressWarnings("unchecked")
+          AccumulatorV2<Integer, Integer> intAccum = (AccumulatorV2<Integer, Integer>) accu.get();
+          intAccum.add(fileReader.getRowGroups().size());
+        }
+        return null;
+      });
     }
   }
 
@@ -160,7 +173,6 @@ public abstract class SpecificParquetRecordReaderBase<T> extends RecordReader<Vo
     ParquetReadOptions options = HadoopReadOptions
       .builder(config, file)
       .withRange(0, length)
-      .withCodecFactory(new ParquetCodecFactory(config, 0))
       .build();
     ParquetFileReader fileReader = ParquetFileReader.open(
       HadoopInputFile.fromPath(file, config), options);
@@ -228,9 +240,7 @@ public abstract class SpecificParquetRecordReaderBase<T> extends RecordReader<Vo
   private static <K, V> Map<K, Set<V>> toSetMultiMap(Map<K, V> map) {
     Map<K, Set<V>> setMultiMap = new HashMap<>();
     for (Map.Entry<K, V> entry : map.entrySet()) {
-      Set<V> set = new HashSet<>();
-      set.add(entry.getValue());
-      setMultiMap.put(entry.getKey(), Collections.unmodifiableSet(set));
+      setMultiMap.put(entry.getKey(), Set.of(entry.getValue()));
     }
     return Collections.unmodifiableMap(setMultiMap);
   }

@@ -16,15 +16,13 @@
 #
 
 import sys
-
 from typing import Optional, Tuple, TYPE_CHECKING
 
-
-from pyspark import since, SparkContext
+from pyspark import since
 from pyspark.ml.common import _java2py, _py2java
 from pyspark.ml.linalg import Matrix, Vector
 from pyspark.ml.wrapper import JavaWrapper, _jvm
-from pyspark.sql.column import Column, _to_seq
+from pyspark.sql.column import Column
 from pyspark.sql.dataframe import DataFrame
 from pyspark.sql.functions import lit
 
@@ -104,12 +102,30 @@ class ChiSquareTest:
         >>> row[0].statistic
         4.0
         """
-        sc = SparkContext._active_spark_context
-        assert sc is not None
+        from pyspark.sql.utils import is_remote
 
-        javaTestObj = _jvm().org.apache.spark.ml.stat.ChiSquareTest
-        args = [_py2java(sc, arg) for arg in (dataset, featuresCol, labelCol, flatten)]
-        return _java2py(sc, javaTestObj.test(*args))
+        if is_remote():
+            from pyspark.ml.wrapper import JavaTransformer
+            from pyspark.ml.connect.serialize import serialize_ml_params_values
+
+            instance = JavaTransformer()
+            instance._java_obj = "org.apache.spark.ml.stat.ChiSquareTestWrapper"
+            serialized_ml_params = serialize_ml_params_values(
+                {"featuresCol": featuresCol, "labelCol": labelCol, "flatten": flatten},
+                dataset.sparkSession.client,  # type: ignore[arg-type,operator]
+            )
+            instance._serialized_ml_params = serialized_ml_params  # type: ignore[attr-defined]
+            return instance.transform(dataset)
+
+        else:
+            from pyspark.core.context import SparkContext
+
+            sc = SparkContext._active_spark_context
+            assert sc is not None
+
+            javaTestObj = getattr(_jvm(), "org.apache.spark.ml.stat.ChiSquareTest")
+            args = [_py2java(sc, arg) for arg in (dataset, featuresCol, labelCol, flatten)]
+            return _java2py(sc, javaTestObj.test(*args))
 
 
 class Correlation:
@@ -173,10 +189,12 @@ class Correlation:
                      [        NaN,         NaN,  1.        ,         NaN],
                      [ 0.4       ,  0.9486... ,         NaN,  1.        ]])
         """
+        from pyspark.core.context import SparkContext
+
         sc = SparkContext._active_spark_context
         assert sc is not None
 
-        javaCorrObj = _jvm().org.apache.spark.ml.stat.Correlation
+        javaCorrObj = getattr(_jvm(), "org.apache.spark.ml.stat.Correlation")
         args = [_py2java(sc, arg) for arg in (dataset, column, method)]
         return _java2py(sc, javaCorrObj.corr(*args))
 
@@ -241,10 +259,12 @@ class KolmogorovSmirnovTest:
         >>> round(ksResult.statistic, 3)
         0.175
         """
+        from pyspark.core.context import SparkContext
+
         sc = SparkContext._active_spark_context
         assert sc is not None
 
-        javaTestObj = _jvm().org.apache.spark.ml.stat.KolmogorovSmirnovTest
+        javaTestObj = getattr(_jvm(), "org.apache.spark.ml.stat.KolmogorovSmirnovTest")
         dataset = _py2java(sc, dataset)
         params = [float(param) for param in params]  # type: ignore[assignment]
         return _java2py(
@@ -426,6 +446,9 @@ class Summarizer:
         -------
         :py:class:`pyspark.ml.stat.SummaryBuilder`
         """
+        from pyspark.core.context import SparkContext
+        from pyspark.sql.classic.column import _to_seq
+
         sc = SparkContext._active_spark_context
         assert sc is not None
 

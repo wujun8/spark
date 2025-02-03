@@ -14,15 +14,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+import itertools
 import sys
-from typing import List, Union, TYPE_CHECKING, cast
+from typing import Any, Iterator, List, Optional, Union, TYPE_CHECKING, cast
 import warnings
 
-from pyspark.rdd import PythonEvalType
+from pyspark.errors import PySparkTypeError
+from pyspark.util import PythonEvalType
 from pyspark.sql.column import Column
 from pyspark.sql.dataframe import DataFrame
 from pyspark.sql.streaming.state import GroupStateTimeout
-from pyspark.sql.types import StructType, _parse_datatype_string
+from pyspark.sql.streaming.stateful_processor_api_client import (
+    StatefulProcessorApiClient,
+    StatefulProcessorHandleState,
+)
+from pyspark.sql.streaming.stateful_processor import (
+    ExpiredTimerInfo,
+    StatefulProcessor,
+    StatefulProcessorHandle,
+    TimerValues,
+)
+from pyspark.sql.streaming.stateful_processor import StatefulProcessor, StatefulProcessorHandle
+from pyspark.sql.streaming.stateful_processor_util import TransformWithStateInPandasFuncMode
+from pyspark.sql.types import StructType
 
 if TYPE_CHECKING:
     from pyspark.sql.pandas._typing import (
@@ -30,6 +44,9 @@ if TYPE_CHECKING:
         PandasGroupedMapFunction,
         PandasGroupedMapFunctionWithState,
         PandasCogroupedMapFunction,
+        ArrowGroupedMapFunction,
+        ArrowCogroupedMapFunction,
+        DataFrameLike as PandasDataFrameLike,
     )
     from pyspark.sql.group import GroupedData
 
@@ -40,7 +57,7 @@ class PandasGroupedOpsMixin:
     can use this class.
     """
 
-    def apply(self, udf: "GroupedMapPandasUserDefinedFunction") -> DataFrame:
+    def apply(self, udf: "GroupedMapPandasUserDefinedFunction") -> "DataFrame":
         """
         It is an alias of :meth:`pyspark.sql.GroupedData.applyInPandas`; however, it takes a
         :meth:`pyspark.sql.functions.pandas_udf` whereas
@@ -72,6 +89,7 @@ class PandasGroupedOpsMixin:
         ... def normalize(pdf):
         ...     v = pdf.v
         ...     return pdf.assign(v=(v - v.mean()) / v.std())
+        ...
         >>> df.groupby("id").apply(normalize).show()  # doctest: +SKIP
         +---+-------------------+
         | id|                  v|
@@ -96,8 +114,9 @@ class PandasGroupedOpsMixin:
                 != PythonEvalType.SQL_GROUPED_MAP_PANDAS_UDF
             )
         ):
-            raise ValueError(
-                "Invalid udf: the udf argument must be a pandas_udf of type " "GROUPED_MAP."
+            raise PySparkTypeError(
+                errorClass="INVALID_UDF_EVAL_TYPE",
+                messageParameters={"eval_type": "SQL_GROUPED_MAP_PANDAS_UDF"},
             )
 
         warnings.warn(
@@ -110,8 +129,8 @@ class PandasGroupedOpsMixin:
         return self.applyInPandas(udf.func, schema=udf.returnType)  # type: ignore[attr-defined]
 
     def applyInPandas(
-        self, func: "PandasGroupedMapFunction", schema: Union[StructType, str]
-    ) -> DataFrame:
+        self, func: "PandasGroupedMapFunction", schema: Union["StructType", str]
+    ) -> "DataFrame":
         """
         Maps each group of the current :class:`DataFrame` using a pandas udf and returns the result
         as a `DataFrame`.
@@ -147,13 +166,14 @@ class PandasGroupedOpsMixin:
         Examples
         --------
         >>> import pandas as pd  # doctest: +SKIP
-        >>> from pyspark.sql.functions import pandas_udf, ceil
+        >>> from pyspark.sql.functions import ceil
         >>> df = spark.createDataFrame(
         ...     [(1, 1.0), (1, 2.0), (2, 3.0), (2, 5.0), (2, 10.0)],
         ...     ("id", "v"))  # doctest: +SKIP
         >>> def normalize(pdf):
         ...     v = pdf.v
         ...     return pdf.assign(v=(v - v.mean()) / v.std())
+        ...
         >>> df.groupby("id").applyInPandas(
         ...     normalize, schema="id long, v double").show()  # doctest: +SKIP
         +---+-------------------+
@@ -180,6 +200,7 @@ class PandasGroupedOpsMixin:
         ...     # key is a tuple of one numpy.int64, which is the value
         ...     # of 'id' for the current group
         ...     return pd.DataFrame([key + (pdf.v.mean(),)])
+        ...
         >>> df.groupby('id').applyInPandas(
         ...     mean_func, schema="id long, v double").show()  # doctest: +SKIP
         +---+---+
@@ -193,6 +214,7 @@ class PandasGroupedOpsMixin:
         ...     # key is a tuple of two numpy.int64s, which is the values
         ...     # of 'id' and 'ceil(df.v / 2)' for the current group
         ...     return pd.DataFrame([key + (pdf.v.sum(),)])
+        ...
         >>> df.groupby(df.id, ceil(df.v / 2)).applyInPandas(
         ...     sum_func, schema="id long, `ceil(v / 2)` long, v double").show()  # doctest: +SKIP
         +---+-----------+----+
@@ -210,8 +232,6 @@ class PandasGroupedOpsMixin:
         into memory, so the user should be aware of the potential OOM risk if data is skewed
         and certain groups are too large to fit in memory.
 
-        This API is experimental.
-
         See Also
         --------
         pyspark.sql.functions.pandas_udf
@@ -224,7 +244,7 @@ class PandasGroupedOpsMixin:
         udf = pandas_udf(func, returnType=schema, functionType=PandasUDFType.GROUPED_MAP)
         df = self._df
         udf_column = udf(*[df[col] for col in df.columns])
-        jdf = self._jgd.flatMapGroupsInPandas(udf_column._jc.expr())
+        jdf = self._jgd.flatMapGroupsInPandas(udf_column._jc)
         return DataFrame(jdf, self.session)
 
     def applyInPandasWithState(
@@ -234,7 +254,7 @@ class PandasGroupedOpsMixin:
         stateStructType: Union[StructType, str],
         outputMode: str,
         timeoutConf: str,
-    ) -> DataFrame:
+    ) -> "DataFrame":
         """
         Applies the given function to each group of data, while maintaining a user-defined
         per-group state. The result Dataset will represent the flattened record returned by the
@@ -272,6 +292,9 @@ class PandasGroupedOpsMixin:
         number of `pandas.DataFrame` in both the input and output can also be arbitrary.
 
         .. versionadded:: 3.4.0
+
+        .. versionchanged:: 3.5.0
+            Supports Spark Connect.
 
         Parameters
         ----------
@@ -312,8 +335,6 @@ class PandasGroupedOpsMixin:
         Notes
         -----
         This function requires a full shuffle.
-
-        This API is experimental.
         """
 
         from pyspark.sql import GroupedData
@@ -327,9 +348,9 @@ class PandasGroupedOpsMixin:
         ]
 
         if isinstance(outputStructType, str):
-            outputStructType = cast(StructType, _parse_datatype_string(outputStructType))
+            outputStructType = cast(StructType, self._df._session._parse_ddl(outputStructType))
         if isinstance(stateStructType, str):
-            stateStructType = cast(StructType, _parse_datatype_string(stateStructType))
+            stateStructType = cast(StructType, self._df._session._parse_ddl(stateStructType))
 
         udf = pandas_udf(
             func,  # type: ignore[call-overload]
@@ -339,12 +360,482 @@ class PandasGroupedOpsMixin:
         df = self._df
         udf_column = udf(*[df[col] for col in df.columns])
         jdf = self._jgd.applyInPandasWithState(
-            udf_column._jc.expr(),
+            udf_column._jc,
             self.session._jsparkSession.parseDataType(outputStructType.json()),
             self.session._jsparkSession.parseDataType(stateStructType.json()),
             outputMode,
             timeoutConf,
         )
+        return DataFrame(jdf, self.session)
+
+    def transformWithStateInPandas(
+        self,
+        statefulProcessor: StatefulProcessor,
+        outputStructType: Union[StructType, str],
+        outputMode: str,
+        timeMode: str,
+        initialState: Optional["GroupedData"] = None,
+        eventTimeColumnName: str = "",
+    ) -> DataFrame:
+        """
+        Invokes methods defined in the stateful processor used in arbitrary state API v2. It
+        requires protobuf, pandas and pyarrow as dependencies to process input/state data. We
+        allow the user to act on per-group set of input rows along with keyed state and the user
+        can choose to output/return 0 or more rows.
+
+        For a streaming dataframe, we will repeatedly invoke the interface methods for new rows
+        in each trigger and the user's state/state variables will be stored persistently across
+        invocations.
+
+        The `statefulProcessor` should be a Python class that implements the interface defined in
+        :class:`StatefulProcessor`.
+
+        The `outputStructType` should be a :class:`StructType` describing the schema of all
+        elements in the returned value, `pandas.DataFrame`. The column labels of all elements in
+        returned `pandas.DataFrame` must either match the field names in the defined schema if
+        specified as strings, or match the field data types by position if not strings,
+        e.g. integer indices.
+
+        The size of each `pandas.DataFrame` in both the input and output can be arbitrary. The
+        number of `pandas.DataFrame` in both the input and output can also be arbitrary.
+
+        .. versionadded:: 4.0.0
+
+        Parameters
+        ----------
+        statefulProcessor : :class:`pyspark.sql.streaming.stateful_processor.StatefulProcessor`
+            Instance of StatefulProcessor whose functions will be invoked by the operator.
+        outputStructType : :class:`pyspark.sql.types.DataType` or str
+            The type of the output records. The value can be either a
+            :class:`pyspark.sql.types.DataType` object or a DDL-formatted type string.
+        outputMode : str
+            The output mode of the stateful processor.
+        timeMode : str
+            The time mode semantics of the stateful processor for timers and TTL.
+        initialState : :class:`pyspark.sql.GroupedData`
+            Optional. The grouped dataframe as initial states used for initialization
+            of state variables in the first batch.
+
+        Examples
+        --------
+        >>> from typing import Iterator
+        ...
+        >>> import pandas as pd # doctest: +SKIP
+        ...
+        >>> from pyspark.sql import Row
+        >>> from pyspark.sql.functions import col, split
+        >>> from pyspark.sql.streaming import StatefulProcessor, StatefulProcessorHandle
+        >>> from pyspark.sql.types import IntegerType, LongType, StringType, StructField, StructType
+        ...
+        >>> spark.conf.set("spark.sql.streaming.stateStore.providerClass",
+        ...     "org.apache.spark.sql.execution.streaming.state.RocksDBStateStoreProvider")
+        ... # Below is a simple example to find erroneous sensors from temperature sensor data. The
+        ... # processor returns a count of total readings, while keeping erroneous reading counts
+        ... # in streaming state. A violation is defined when the temperature is above 100.
+        ... # The input data is a DataFrame with the following schema:
+        ... #    `id: string, temperature: long`.
+        ... # The output schema and state schema are defined as below.
+        >>> output_schema = StructType([
+        ...     StructField("id", StringType(), True),
+        ...     StructField("count", IntegerType(), True)
+        ... ])
+        >>> state_schema = StructType([
+        ...     StructField("value", IntegerType(), True)
+        ... ])
+        >>> class SimpleStatefulProcessor(StatefulProcessor):
+        ...     def init(self, handle: StatefulProcessorHandle):
+        ...         self.num_violations_state = handle.getValueState("numViolations", state_schema)
+        ...
+        ...     def handleInputRows(self, key, rows):
+        ...         new_violations = 0
+        ...         count = 0
+        ...         exists = self.num_violations_state.exists()
+        ...         if exists:
+        ...             existing_violations_row = self.num_violations_state.get()
+        ...             existing_violations = existing_violations_row[0]
+        ...         else:
+        ...             existing_violations = 0
+        ...         for pdf in rows:
+        ...             pdf_count = pdf.count()
+        ...             count += pdf_count.get('temperature')
+        ...             violations_pdf = pdf.loc[pdf['temperature'] > 100]
+        ...             new_violations += violations_pdf.count().get('temperature')
+        ...         updated_violations = new_violations + existing_violations
+        ...         self.num_violations_state.update((updated_violations,))
+        ...         yield pd.DataFrame({'id': key, 'count': count})
+        ...
+        ...     def close(self) -> None:
+        ...         pass
+
+        Input DataFrame:
+        +---+-----------+
+        | id|temperature|
+        +---+-----------+
+        |  0|        123|
+        |  0|         23|
+        |  1|         33|
+        |  1|        188|
+        |  1|         88|
+        +---+-----------+
+
+        >>> df.groupBy("value").transformWithStateInPandas(statefulProcessor =
+        ...     SimpleStatefulProcessor(), outputStructType=output_schema, outputMode="Update",
+        ...     timeMode="None") # doctest: +SKIP
+
+        Output DataFrame:
+        +---+-----+
+        | id|count|
+        +---+-----+
+        |  0|    2|
+        |  1|    3|
+        +---+-----+
+
+        Notes
+        -----
+        This function requires a full shuffle.
+        """
+
+        from pyspark.sql import GroupedData
+        from pyspark.sql.functions import pandas_udf
+
+        assert isinstance(self, GroupedData)
+        if initialState is not None:
+            assert isinstance(initialState, GroupedData)
+        if isinstance(outputStructType, str):
+            outputStructType = cast(StructType, self._df._session._parse_ddl(outputStructType))
+
+        def handle_pre_init(
+            statefulProcessorApiClient: StatefulProcessorApiClient,
+        ) -> Iterator["PandasDataFrameLike"]:
+            # Driver handle is different from the handle used on executors;
+            # On JVM side, we will use `DriverStatefulProcessorHandleImpl` for driver handle which
+            # will only be used for handling init() and get the state schema on the driver.
+            driver_handle = StatefulProcessorHandle(statefulProcessorApiClient)
+            statefulProcessorApiClient.set_handle_state(StatefulProcessorHandleState.PRE_INIT)
+            statefulProcessor.init(driver_handle)
+
+            # This method is used for the driver-side stateful processor after we have collected
+            # all the necessary schemas. This instance of the DriverStatefulProcessorHandleImpl
+            # won't be used again on JVM.
+            statefulProcessor.close()
+
+            # return a dummy results, no return value is needed for pre init
+            return iter([])
+
+        def handle_data_rows(
+            statefulProcessorApiClient: StatefulProcessorApiClient,
+            key: Any,
+            inputRows: Optional[Iterator["PandasDataFrameLike"]] = None,
+        ) -> Iterator["PandasDataFrameLike"]:
+            statefulProcessorApiClient.set_implicit_key(key)
+
+            batch_timestamp, watermark_timestamp = statefulProcessorApiClient.get_timestamps(
+                timeMode
+            )
+
+            # process with data rows
+            if inputRows is not None:
+                data_iter = statefulProcessor.handleInputRows(
+                    key, inputRows, TimerValues(batch_timestamp, watermark_timestamp)
+                )
+                return data_iter
+            else:
+                return iter([])
+
+        def handle_expired_timers(
+            statefulProcessorApiClient: StatefulProcessorApiClient,
+        ) -> Iterator["PandasDataFrameLike"]:
+            batch_timestamp, watermark_timestamp = statefulProcessorApiClient.get_timestamps(
+                timeMode
+            )
+
+            if timeMode.lower() == "processingtime":
+                expiry_list_iter = statefulProcessorApiClient.get_expiry_timers_iterator(
+                    batch_timestamp
+                )
+            elif timeMode.lower() == "eventtime":
+                expiry_list_iter = statefulProcessorApiClient.get_expiry_timers_iterator(
+                    watermark_timestamp
+                )
+            else:
+                expiry_list_iter = iter([[]])
+
+            # process with expiry timers, only timer related rows will be emitted
+            for expiry_list in expiry_list_iter:
+                for key_obj, expiry_timestamp in expiry_list:
+                    statefulProcessorApiClient.set_implicit_key(key_obj)
+                    for pd in statefulProcessor.handleExpiredTimer(
+                        key=key_obj,
+                        timerValues=TimerValues(batch_timestamp, watermark_timestamp),
+                        expiredTimerInfo=ExpiredTimerInfo(expiry_timestamp),
+                    ):
+                        yield pd
+                    statefulProcessorApiClient.delete_timer(expiry_timestamp)
+
+        def transformWithStateUDF(
+            statefulProcessorApiClient: StatefulProcessorApiClient,
+            mode: TransformWithStateInPandasFuncMode,
+            key: Any,
+            inputRows: Iterator["PandasDataFrameLike"],
+        ) -> Iterator["PandasDataFrameLike"]:
+            if mode == TransformWithStateInPandasFuncMode.PRE_INIT:
+                return handle_pre_init(statefulProcessorApiClient)
+
+            handle = StatefulProcessorHandle(statefulProcessorApiClient)
+
+            if statefulProcessorApiClient.handle_state == StatefulProcessorHandleState.CREATED:
+                statefulProcessor.init(handle)
+                statefulProcessorApiClient.set_handle_state(
+                    StatefulProcessorHandleState.INITIALIZED
+                )
+
+            if mode == TransformWithStateInPandasFuncMode.PROCESS_TIMER:
+                statefulProcessorApiClient.set_handle_state(
+                    StatefulProcessorHandleState.DATA_PROCESSED
+                )
+                result = handle_expired_timers(statefulProcessorApiClient)
+                return result
+            elif mode == TransformWithStateInPandasFuncMode.COMPLETE:
+                statefulProcessorApiClient.set_handle_state(
+                    StatefulProcessorHandleState.TIMER_PROCESSED
+                )
+                statefulProcessorApiClient.remove_implicit_key()
+                statefulProcessor.close()
+                statefulProcessorApiClient.set_handle_state(StatefulProcessorHandleState.CLOSED)
+                return iter([])
+            else:
+                # mode == TransformWithStateInPandasFuncMode.PROCESS_DATA
+                result = handle_data_rows(statefulProcessorApiClient, key, inputRows)
+                return result
+
+        def transformWithStateWithInitStateUDF(
+            statefulProcessorApiClient: StatefulProcessorApiClient,
+            mode: TransformWithStateInPandasFuncMode,
+            key: Any,
+            inputRows: Iterator["PandasDataFrameLike"],
+            initialStates: Optional[Iterator["PandasDataFrameLike"]] = None,
+        ) -> Iterator["PandasDataFrameLike"]:
+            """
+            UDF for TWS operator with non-empty initial states. Possible input combinations
+            of inputRows and initialStates iterator:
+            - Both `inputRows` and `initialStates` are non-empty. Both input rows and initial
+             states contains the grouping key and data.
+            - `InitialStates` is non-empty, while `inputRows` is empty. Only initial states
+             contains the grouping key and data, and it is first batch.
+            - `initialStates` is empty, while `inputRows` is non-empty. Only inputRows contains the
+             grouping key and data, and it is first batch.
+            - `initialStates` is None, while `inputRows` is not empty. This is not first batch.
+             `initialStates` is initialized to the positional value as None.
+            """
+            if mode == TransformWithStateInPandasFuncMode.PRE_INIT:
+                return handle_pre_init(statefulProcessorApiClient)
+
+            handle = StatefulProcessorHandle(statefulProcessorApiClient)
+
+            if statefulProcessorApiClient.handle_state == StatefulProcessorHandleState.CREATED:
+                statefulProcessor.init(handle)
+                statefulProcessorApiClient.set_handle_state(
+                    StatefulProcessorHandleState.INITIALIZED
+                )
+
+            if mode == TransformWithStateInPandasFuncMode.PROCESS_TIMER:
+                statefulProcessorApiClient.set_handle_state(
+                    StatefulProcessorHandleState.DATA_PROCESSED
+                )
+                result = handle_expired_timers(statefulProcessorApiClient)
+                return result
+            elif mode == TransformWithStateInPandasFuncMode.COMPLETE:
+                statefulProcessorApiClient.remove_implicit_key()
+                statefulProcessor.close()
+                statefulProcessorApiClient.set_handle_state(StatefulProcessorHandleState.CLOSED)
+                return iter([])
+            else:
+                # mode == TransformWithStateInPandasFuncMode.PROCESS_DATA
+                batch_timestamp, watermark_timestamp = statefulProcessorApiClient.get_timestamps(
+                    timeMode
+                )
+
+            # only process initial state if first batch and initial state is not None
+            if initialStates is not None:
+                for cur_initial_state in initialStates:
+                    statefulProcessorApiClient.set_implicit_key(key)
+                    statefulProcessor.handleInitialState(
+                        key, cur_initial_state, TimerValues(batch_timestamp, watermark_timestamp)
+                    )
+
+            # if we don't have input rows for the given key but only have initial state
+            # for the grouping key, the inputRows iterator could be empty
+            input_rows_empty = False
+            try:
+                first = next(inputRows)
+            except StopIteration:
+                input_rows_empty = True
+            else:
+                inputRows = itertools.chain([first], inputRows)
+
+            if not input_rows_empty:
+                result = handle_data_rows(statefulProcessorApiClient, key, inputRows)
+            else:
+                result = iter([])
+
+            return result
+
+        if isinstance(outputStructType, str):
+            outputStructType = cast(StructType, self._df._session._parse_ddl(outputStructType))
+
+        df = self._df
+
+        if initialState is None:
+            initial_state_java_obj = None
+            udf = pandas_udf(
+                transformWithStateUDF,  # type: ignore
+                returnType=outputStructType,
+                functionType=PythonEvalType.SQL_TRANSFORM_WITH_STATE_PANDAS_UDF,
+            )
+        else:
+            initial_state_java_obj = initialState._jgd
+            udf = pandas_udf(
+                transformWithStateWithInitStateUDF,  # type: ignore
+                returnType=outputStructType,
+                functionType=PythonEvalType.SQL_TRANSFORM_WITH_STATE_PANDAS_INIT_STATE_UDF,
+            )
+
+        udf_column = udf(*[df[col] for col in df.columns])
+
+        jdf = self._jgd.transformWithStateInPandas(
+            udf_column._jc,
+            self.session._jsparkSession.parseDataType(outputStructType.json()),
+            outputMode,
+            timeMode,
+            initial_state_java_obj,
+            eventTimeColumnName,
+        )
+        return DataFrame(jdf, self.session)
+
+    def applyInArrow(
+        self, func: "ArrowGroupedMapFunction", schema: Union[StructType, str]
+    ) -> "DataFrame":
+        """
+        Maps each group of the current :class:`DataFrame` using an Arrow udf and returns the result
+        as a `DataFrame`.
+
+        The function should take a `pyarrow.Table` and return another
+        `pyarrow.Table`. Alternatively, the user can pass a function that takes
+        a tuple of `pyarrow.Scalar` grouping key(s) and a `pyarrow.Table`.
+        For each group, all columns are passed together as a `pyarrow.Table`
+        to the user-function and the returned `pyarrow.Table` are combined as a
+        :class:`DataFrame`.
+
+        The `schema` should be a :class:`StructType` describing the schema of the returned
+        `pyarrow.Table`. The column labels of the returned `pyarrow.Table` must either match
+        the field names in the defined schema if specified as strings, or match the
+        field data types by position if not strings, e.g. integer indices.
+        The length of the returned `pyarrow.Table` can be arbitrary.
+
+        .. versionadded:: 4.0.0
+
+        Parameters
+        ----------
+        func : function
+            a Python native function that takes a `pyarrow.Table` and outputs a
+            `pyarrow.Table`, or that takes one tuple (grouping keys) and a
+            `pyarrow.Table` and outputs a `pyarrow.Table`.
+        schema : :class:`pyspark.sql.types.DataType` or str
+            the return type of the `func` in PySpark. The value can be either a
+            :class:`pyspark.sql.types.DataType` object or a DDL-formatted type string.
+
+        Examples
+        --------
+        >>> from pyspark.sql.functions import ceil
+        >>> import pyarrow  # doctest: +SKIP
+        >>> import pyarrow.compute as pc  # doctest: +SKIP
+        >>> df = spark.createDataFrame(
+        ...     [(1, 1.0), (1, 2.0), (2, 3.0), (2, 5.0), (2, 10.0)],
+        ...     ("id", "v"))  # doctest: +SKIP
+        >>> def normalize(table):
+        ...     v = table.column("v")
+        ...     norm = pc.divide(pc.subtract(v, pc.mean(v)), pc.stddev(v, ddof=1))
+        ...     return table.set_column(1, "v", norm)
+        >>> df.groupby("id").applyInArrow(
+        ...     normalize, schema="id long, v double").show()  # doctest: +SKIP
+        +---+-------------------+
+        | id|                  v|
+        +---+-------------------+
+        |  1|-0.7071067811865475|
+        |  1| 0.7071067811865475|
+        |  2|-0.8320502943378437|
+        |  2|-0.2773500981126146|
+        |  2| 1.1094003924504583|
+        +---+-------------------+
+
+        Alternatively, the user can pass a function that takes two arguments.
+        In this case, the grouping key(s) will be passed as the first argument and the data will
+        be passed as the second argument. The grouping key(s) will be passed as a tuple of Arrow
+        scalars types, e.g., `pyarrow.Int32Scalar` and `pyarrow.FloatScalar`. The data will still
+        be passed in as a `pyarrow.Table` containing all columns from the original Spark DataFrame.
+        This is useful when the user does not want to hardcode grouping key(s) in the function.
+
+        >>> df = spark.createDataFrame(
+        ...     [(1, 1.0), (1, 2.0), (2, 3.0), (2, 5.0), (2, 10.0)],
+        ...     ("id", "v"))  # doctest: +SKIP
+        >>> def mean_func(key, table):
+        ...     # key is a tuple of one pyarrow.Int64Scalar, which is the value
+        ...     # of 'id' for the current group
+        ...     mean = pc.mean(table.column("v"))
+        ...     return pyarrow.Table.from_pydict({"id": [key[0].as_py()], "v": [mean.as_py()]})
+        >>> df.groupby('id').applyInArrow(
+        ...     mean_func, schema="id long, v double")  # doctest: +SKIP
+        +---+---+
+        | id|  v|
+        +---+---+
+        |  1|1.5|
+        |  2|6.0|
+        +---+---+
+
+        >>> def sum_func(key, table):
+        ...     # key is a tuple of two pyarrow.Int64Scalars, which is the values
+        ...     # of 'id' and 'ceil(df.v / 2)' for the current group
+        ...     sum = pc.sum(table.column("v"))
+        ...     return pyarrow.Table.from_pydict({
+        ...         "id": [key[0].as_py()],
+        ...         "ceil(v / 2)": [key[1].as_py()],
+        ...         "v": [sum.as_py()]
+        ...     })
+        >>> df.groupby(df.id, ceil(df.v / 2)).applyInArrow(
+        ...     sum_func, schema="id long, `ceil(v / 2)` long, v double").show()  # doctest: +SKIP
+        +---+-----------+----+
+        | id|ceil(v / 2)|   v|
+        +---+-----------+----+
+        |  2|          5|10.0|
+        |  1|          1| 3.0|
+        |  2|          3| 5.0|
+        |  2|          2| 3.0|
+        +---+-----------+----+
+
+        Notes
+        -----
+        This function requires a full shuffle. All the data of a group will be loaded
+        into memory, so the user should be aware of the potential OOM risk if data is skewed
+        and certain groups are too large to fit in memory.
+
+        This API is unstable, and for developers.
+
+        See Also
+        --------
+        pyspark.sql.functions.pandas_udf
+        """
+        from pyspark.sql import GroupedData
+        from pyspark.sql.functions import pandas_udf
+
+        assert isinstance(self, GroupedData)
+
+        # The usage of the pandas_udf is internal so type checking is disabled.
+        udf = pandas_udf(
+            func, returnType=schema, functionType=PythonEvalType.SQL_GROUPED_MAP_ARROW_UDF
+        )  # type: ignore[call-overload]
+        df = self._df
+        udf_column = udf(*[df[col] for col in df.columns])
+        jdf = self._jgd.flatMapGroupsInArrow(udf_column._jc)
         return DataFrame(jdf, self.session)
 
     def cogroup(self, other: "GroupedData") -> "PandasCogroupedOps":
@@ -374,10 +865,6 @@ class PandasCogroupedOps:
 
     .. versionchanged:: 3.4.0
         Support Spark Connect.
-
-    Notes
-    -----
-    This API is experimental.
     """
 
     def __init__(self, gd1: "GroupedData", gd2: "GroupedData"):
@@ -385,8 +872,8 @@ class PandasCogroupedOps:
         self._gd2 = gd2
 
     def applyInPandas(
-        self, func: "PandasCogroupedMapFunction", schema: Union[StructType, str]
-    ) -> DataFrame:
+        self, func: "PandasCogroupedMapFunction", schema: Union["StructType", str]
+    ) -> "DataFrame":
         """
         Applies a function to each cogroup using pandas and returns the result
         as a `DataFrame`.
@@ -421,7 +908,6 @@ class PandasCogroupedOps:
 
         Examples
         --------
-        >>> from pyspark.sql.functions import pandas_udf
         >>> df1 = spark.createDataFrame(
         ...     [(20000101, 1, 1.0), (20000101, 2, 2.0), (20000102, 1, 3.0), (20000102, 2, 4.0)],
         ...     ("time", "id", "v1"))
@@ -430,6 +916,7 @@ class PandasCogroupedOps:
         ...     ("time", "id", "v2"))
         >>> def asof_join(l, r):
         ...     return pd.merge_asof(l, r, on="time", by="id")
+        ...
         >>> df1.groupby("id").cogroup(df2.groupby("id")).applyInPandas(
         ...     asof_join, schema="time int, id int, v1 double, v2 string"
         ... ).show()  # doctest: +SKIP
@@ -453,6 +940,7 @@ class PandasCogroupedOps:
         ...         return pd.merge_asof(l, r, on="time", by="id")
         ...     else:
         ...         return pd.DataFrame(columns=['time', 'id', 'v1', 'v2'])
+        ...
         >>> df1.groupby("id").cogroup(df2.groupby("id")).applyInPandas(
         ...     asof_join, "time int, id int, v1 double, v2 string").show()  # doctest: +SKIP
         +--------+---+---+---+
@@ -468,8 +956,6 @@ class PandasCogroupedOps:
         into memory, so the user should be aware of the potential OOM risk if data is skewed
         and certain groups are too large to fit in memory.
 
-        This API is experimental.
-
         See Also
         --------
         pyspark.sql.functions.pandas_udf
@@ -483,7 +969,105 @@ class PandasCogroupedOps:
 
         all_cols = self._extract_cols(self._gd1) + self._extract_cols(self._gd2)
         udf_column = udf(*all_cols)
-        jdf = self._gd1._jgd.flatMapCoGroupsInPandas(self._gd2._jgd, udf_column._jc.expr())
+        jdf = self._gd1._jgd.flatMapCoGroupsInPandas(self._gd2._jgd, udf_column._jc)
+        return DataFrame(jdf, self._gd1.session)
+
+    def applyInArrow(
+        self, func: "ArrowCogroupedMapFunction", schema: Union[StructType, str]
+    ) -> "DataFrame":
+        """
+        Applies a function to each cogroup using Arrow and returns the result
+        as a `DataFrame`.
+
+        The function should take two `pyarrow.Table`\\s and return another
+        `pyarrow.Table`. Alternatively, the user can pass a function that takes
+        a tuple of `pyarrow.Scalar` grouping key(s) and the two `pyarrow.Table`\\s.
+        For each side of the cogroup, all columns are passed together as a
+        `pyarrow.Table` to the user-function and the returned `pyarrow.Table` are combined as
+        a :class:`DataFrame`.
+
+        The `schema` should be a :class:`StructType` describing the schema of the returned
+        `pyarrow.Table`. The column labels of the returned `pyarrow.Table` must either match
+        the field names in the defined schema if specified as strings, or match the
+        field data types by position if not strings, e.g. integer indices.
+        The length of the returned `pyarrow.Table` can be arbitrary.
+
+        .. versionadded:: 4.0.0
+
+        Parameters
+        ----------
+        func : function
+            a Python native function that takes two `pyarrow.Table`\\s, and
+            outputs a `pyarrow.Table`, or that takes one tuple (grouping keys) and two
+            ``pyarrow.Table``\\s, and outputs a ``pyarrow.Table``.
+        schema : :class:`pyspark.sql.types.DataType` or str
+            the return type of the `func` in PySpark. The value can be either a
+            :class:`pyspark.sql.types.DataType` object or a DDL-formatted type string.
+
+        Examples
+        --------
+        >>> import pyarrow  # doctest: +SKIP
+        >>> df1 = spark.createDataFrame([(1, 1.0), (2, 2.0), (1, 3.0), (2, 4.0)], ("id", "v1"))
+        >>> df2 = spark.createDataFrame([(1, "x"), (2, "y")], ("id", "v2"))
+        >>> def summarize(l, r):
+        ...     return pyarrow.Table.from_pydict({
+        ...         "left": [l.num_rows],
+        ...         "right": [r.num_rows]
+        ...     })
+        >>> df1.groupby("id").cogroup(df2.groupby("id")).applyInArrow(
+        ...     summarize, schema="left long, right long"
+        ... ).show()  # doctest: +SKIP
+        +----+-----+
+        |left|right|
+        +----+-----+
+        |   2|    1|
+        |   2|    1|
+        +----+-----+
+
+        Alternatively, the user can define a function that takes three arguments.  In this case,
+        the grouping key(s) will be passed as the first argument and the data will be passed as the
+        second and third arguments.  The grouping key(s) will be passed as a tuple of Arrow scalars
+        types, e.g., `pyarrow.Int32Scalar` and `pyarrow.FloatScalar`. The data will still be passed
+        in as two `pyarrow.Table`\\s containing all columns from the original Spark DataFrames.
+
+        >>> def summarize(key, l, r):
+        ...     return pyarrow.Table.from_pydict({
+        ...         "key": [key[0].as_py()],
+        ...         "left": [l.num_rows],
+        ...         "right": [r.num_rows]
+        ...     })
+        >>> df1.groupby("id").cogroup(df2.groupby("id")).applyInArrow(
+        ...     summarize, schema="key long, left long, right long"
+        ... ).show()  # doctest: +SKIP
+        +---+----+-----+
+        |key|left|right|
+        +---+----+-----+
+        |  1|   2|    1|
+        |  2|   2|    1|
+        +---+----+-----+
+
+        Notes
+        -----
+        This function requires a full shuffle. All the data of a cogroup will be loaded
+        into memory, so the user should be aware of the potential OOM risk if data is skewed
+        and certain groups are too large to fit in memory.
+
+        This API is unstable, and for developers.
+
+        See Also
+        --------
+        pyspark.sql.functions.pandas_udf
+        """
+        from pyspark.sql.pandas.functions import pandas_udf
+
+        # The usage of the pandas_udf is internal so type checking is disabled.
+        udf = pandas_udf(
+            func, returnType=schema, functionType=PythonEvalType.SQL_COGROUPED_MAP_ARROW_UDF
+        )  # type: ignore[call-overload]
+
+        all_cols = self._extract_cols(self._gd1) + self._extract_cols(self._gd2)
+        udf_column = udf(*all_cols)
+        jdf = self._gd1._jgd.flatMapCoGroupsInArrow(self._gd2._jgd, udf_column._jc)
         return DataFrame(jdf, self._gd1.session)
 
     @staticmethod

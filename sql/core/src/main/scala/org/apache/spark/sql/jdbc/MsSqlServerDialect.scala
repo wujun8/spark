@@ -22,24 +22,19 @@ import java.util.Locale
 
 import scala.util.control.NonFatal
 
-import org.apache.spark.sql.AnalysisException
+import org.apache.spark.SparkThrowable
 import org.apache.spark.sql.catalyst.analysis.NonEmptyNamespaceException
+import org.apache.spark.sql.connector.catalog.Identifier
 import org.apache.spark.sql.connector.expressions.{Expression, NullOrdering, SortDirection}
-import org.apache.spark.sql.errors.QueryExecutionErrors
+import org.apache.spark.sql.connector.expressions.filter.Predicate
+import org.apache.spark.sql.errors.{QueryCompilationErrors, QueryExecutionErrors}
 import org.apache.spark.sql.execution.datasources.jdbc.JDBCOptions
 import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.jdbc.MsSqlServerDialect.{GEOGRAPHY, GEOMETRY}
 import org.apache.spark.sql.types._
 
 
-private object MsSqlServerDialect extends JdbcDialect {
-
-  // Special JDBC types in Microsoft SQL Server.
-  // https://github.com/microsoft/mssql-jdbc/blob/v8.2.2/src/main/java/microsoft/sql/Types.java
-  private object SpecificTypes {
-    val GEOMETRY = -157
-    val GEOGRAPHY = -158
-  }
-
+private case class MsSqlServerDialect() extends JdbcDialect with NoLegacyJDBCError {
   override def canHandle(url: String): Boolean =
     url.toLowerCase(Locale.ROOT).startsWith("jdbc:sqlserver")
 
@@ -50,6 +45,7 @@ private object MsSqlServerDialect extends JdbcDialect {
   // scalastyle:on line.size.limit
   override def compileValue(value: Any): Any = value match {
     case booleanValue: Boolean => if (booleanValue) 1 else 0
+    case binaryValue: Array[Byte] => binaryValue.map("%02X".format(_)).mkString("0x", "", "")
     case other => super.compileValue(other)
   }
 
@@ -64,6 +60,8 @@ private object MsSqlServerDialect extends JdbcDialect {
     supportedFunctions.contains(funcName)
 
   class MsSqlServerSQLBuilder extends JDBCSQLBuilder {
+    override protected def predicateToIntSQL(input: String): String =
+      "IIF(" + input + ", 1, 0)"
     override def visitSortOrder(
         sortKey: String, sortDirection: SortDirection, nullOrdering: NullOrdering): String = {
       (sortDirection, nullOrdering) match {
@@ -85,6 +83,36 @@ private object MsSqlServerDialect extends JdbcDialect {
       case "STDDEV_SAMP" => "STDEV"
       case _ => super.dialectFunctionName(funcName)
     }
+
+    override def build(expr: Expression): String = {
+      // MsSqlServer does not support boolean comparison using standard comparison operators
+      // We shouldn't propagate these queries to MsSqlServer
+      expr match {
+        case e: Predicate => e.name() match {
+          case "=" | "<>" | "<=>" | "<" | "<=" | ">" | ">=" =>
+            val Array(l, r) = e.children().map(inputToSQLNoBool)
+            visitBinaryComparison(e.name(), l, r)
+          case "CASE_WHEN" =>
+            // Since MsSqlServer cannot handle boolean expressions inside
+            // a CASE WHEN, it is necessary to convert those to another
+            // CASE WHEN expression that will return 1 or 0 depending on
+            // the result.
+            // Example:
+            // In:  ... CASE WHEN a = b THEN c = d ... END
+            // Out: ... CASE WHEN a = b THEN CASE WHEN c = d THEN 1 ELSE 0 END ... END = 1
+            val stringArray = e.children().grouped(2).flatMap {
+              case Array(whenExpression, thenExpression) =>
+                Array(inputToSQL(whenExpression), inputToSQLNoBool(thenExpression))
+              case Array(elseExpression) =>
+                Array(inputToSQLNoBool(elseExpression))
+            }.toArray
+
+            visitCaseWhen(stringArray) + " = 1"
+          case _ => super.build(expr)
+        }
+        case _ => super.build(expr)
+      }
+    }
   }
 
   override def compileExpression(expr: Expression): Option[String] = {
@@ -100,20 +128,22 @@ private object MsSqlServerDialect extends JdbcDialect {
 
   override def getCatalystType(
       sqlType: Int, typeName: String, size: Int, md: MetadataBuilder): Option[DataType] = {
-    if (typeName.contains("datetimeoffset")) {
-      // String is recommend by Microsoft SQL Server for datetimeoffset types in non-MS clients
-      Option(StringType)
-    } else {
-      if (SQLConf.get.legacyMsSqlServerNumericMappingEnabled) {
-        None
-      } else {
-        sqlType match {
-          case java.sql.Types.SMALLINT => Some(ShortType)
-          case java.sql.Types.REAL => Some(FloatType)
-          case SpecificTypes.GEOMETRY | SpecificTypes.GEOGRAPHY => Some(BinaryType)
-          case _ => None
+    sqlType match {
+      case _ if typeName.contains("datetimeoffset") =>
+        if (SQLConf.get.legacyMsSqlServerDatetimeOffsetMappingEnabled) {
+          Some(StringType)
+        } else {
+          Some(TimestampType)
         }
-      }
+      case java.sql.Types.SMALLINT | java.sql.Types.TINYINT
+          if !SQLConf.get.legacyMsSqlServerNumericMappingEnabled =>
+        // Data range of TINYINT is 0-255 so it needs to be stored in ShortType.
+        // Reference doc: https://learn.microsoft.com/en-us/sql/t-sql/data-types
+        Some(ShortType)
+      case java.sql.Types.REAL if !SQLConf.get.legacyMsSqlServerNumericMappingEnabled =>
+        Some(FloatType)
+      case GEOMETRY | GEOGRAPHY => Some(BinaryType)
+      case _ => None
     }
   }
 
@@ -125,6 +155,7 @@ private object MsSqlServerDialect extends JdbcDialect {
     case BinaryType => Some(JdbcType("VARBINARY(MAX)", java.sql.Types.VARBINARY))
     case ShortType if !SQLConf.get.legacyMsSqlServerNumericMappingEnabled =>
       Some(JdbcType("SMALLINT", java.sql.Types.SMALLINT))
+    case ByteType => Some(JdbcType("SMALLINT", java.sql.Types.TINYINT))
     case _ => None
   }
 
@@ -133,8 +164,9 @@ private object MsSqlServerDialect extends JdbcDialect {
   // scalastyle:off line.size.limit
   // See https://docs.microsoft.com/en-us/sql/relational-databases/system-stored-procedures/sp-rename-transact-sql?view=sql-server-ver15
   // scalastyle:on line.size.limit
-  override def renameTable(oldTable: String, newTable: String): String = {
-    s"EXEC sp_rename $oldTable, $newTable"
+  override def renameTable(oldTable: Identifier, newTable: Identifier): String = {
+    s"EXEC sp_rename ${getFullyQualifiedQuotedTableName(oldTable)}, " +
+      s"${getFullyQualifiedQuotedTableName(newTable)}"
   }
 
   // scalastyle:off line.size.limit
@@ -186,14 +218,27 @@ private object MsSqlServerDialect extends JdbcDialect {
     if (limit > 0) s"TOP ($limit)" else ""
   }
 
-  override def classifyException(message: String, e: Throwable): AnalysisException = {
+  override def classifyException(
+      e: Throwable,
+      errorClass: String,
+      messageParameters: Map[String, String],
+      description: String,
+      isRuntime: Boolean): Throwable with SparkThrowable = {
     e match {
       case sqlException: SQLException =>
         sqlException.getErrorCode match {
-          case 3729 => throw NonEmptyNamespaceException(message, cause = Some(e))
-          case _ => super.classifyException(message, e)
+          case 3729 =>
+            throw NonEmptyNamespaceException(
+              namespace = messageParameters.get("namespace").toArray,
+              details = sqlException.getMessage,
+              cause = Some(e))
+           case 15335 if errorClass == "FAILED_JDBC.RENAME_TABLE" =>
+             val newTable = messageParameters("newName")
+             throw QueryCompilationErrors.tableAlreadyExistsError(newTable)
+          case _ =>
+            super.classifyException(e, errorClass, messageParameters, description, isRuntime)
         }
-      case _ => super.classifyException(message, e)
+      case _ => super.classifyException(e, errorClass, messageParameters, description, isRuntime)
     }
   }
 
@@ -204,7 +249,7 @@ private object MsSqlServerDialect extends JdbcDialect {
       val limitClause = dialect.getLimitClause(limit)
 
       options.prepareQuery +
-        s"SELECT $limitClause $columnList FROM ${options.tableOrQuery} $tableSampleClause" +
+        s"SELECT $limitClause $columnList FROM ${options.tableOrQuery}" +
         s" $whereClause $groupByClause $orderByClause"
     }
   }
@@ -213,4 +258,11 @@ private object MsSqlServerDialect extends JdbcDialect {
     new MsSqlServerSQLQueryBuilder(this, options)
 
   override def supportsLimit: Boolean = true
+}
+
+private object MsSqlServerDialect {
+  // Special JDBC types in Microsoft SQL Server.
+  // https://github.com/microsoft/mssql-jdbc/blob/v9.4.1/src/main/java/microsoft/sql/Types.java
+  final val GEOMETRY = -157
+  final val GEOGRAPHY = -158
 }

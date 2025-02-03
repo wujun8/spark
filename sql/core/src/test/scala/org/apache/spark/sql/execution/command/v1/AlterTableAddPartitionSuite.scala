@@ -39,11 +39,15 @@ trait AlterTableAddPartitionSuiteBase extends command.AlterTableAddPartitionSuit
   test("empty string as partition value") {
     withNamespaceAndTable("ns", "tbl") { t =>
       sql(s"CREATE TABLE $t (col1 INT, p1 STRING) $defaultUsing PARTITIONED BY (p1)")
-      val errMsg = intercept[AnalysisException] {
-        sql(s"ALTER TABLE $t ADD PARTITION (p1 = '')")
-      }.getMessage
-      assert(errMsg.contains("Partition spec is invalid. " +
-        "The spec ([p1=]) contains an empty partition column value"))
+      checkError(
+        exception = intercept[AnalysisException] {
+          sql(s"ALTER TABLE $t ADD PARTITION (p1 = '')")
+        },
+        condition = "_LEGACY_ERROR_TEMP_1076",
+        parameters = Map(
+          "details" -> "The spec ([p1=]) contains an empty partition column value"
+        )
+      )
     }
   }
 
@@ -129,7 +133,7 @@ trait AlterTableAddPartitionSuiteBase extends command.AlterTableAddPartitionSuit
         checkCachedRelation("v1", Seq(Row(0, 0), Row(0, 1), Row(0, 2)))
       }
 
-      val v2 = s"${spark.sharedState.globalTempViewManager.database}.v2"
+      val v2 = s"${spark.sharedState.globalTempDB}.v2"
       withGlobalTempView("v2") {
         sql(s"CREATE GLOBAL TEMP VIEW v2 AS SELECT * FROM $t")
         cacheRelation(v2)
@@ -151,7 +155,7 @@ trait AlterTableAddPartitionSuiteBase extends command.AlterTableAddPartitionSuit
           " PARTITION (id=2) LOCATION 'loc1'")
       }
       checkError(e,
-        errorClass = "PARTITIONS_ALREADY_EXIST",
+        condition = "PARTITIONS_ALREADY_EXIST",
         parameters = Map("partitionList" -> "PARTITION (`id` = 2)",
           "tableName" -> "`ns`.`tbl`"))
 

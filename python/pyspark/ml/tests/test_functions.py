@@ -14,18 +14,31 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-import numpy as np
-import pandas as pd
 import unittest
 
+import numpy as np
+
+from pyspark.loose_version import LooseVersion
 from pyspark.ml.functions import predict_batch_udf
 from pyspark.sql.functions import array, struct, col
 from pyspark.sql.types import ArrayType, DoubleType, IntegerType, StructType, StructField, FloatType
 from pyspark.testing.mlutils import SparkSessionTestCase
+from pyspark.testing.sqlutils import (
+    have_pandas,
+    have_pyarrow,
+    pandas_requirement_message,
+    pyarrow_requirement_message,
+)
 
 
+@unittest.skipIf(
+    not have_pandas or not have_pyarrow,
+    pandas_requirement_message or pyarrow_requirement_message,
+)
 class PredictBatchUDFTests(SparkSessionTestCase):
     def setUp(self):
+        import pandas as pd
+
         super(PredictBatchUDFTests, self).setUp()
         self.data = np.arange(0, 1000, dtype=np.float64).reshape(-1, 4)
 
@@ -71,6 +84,11 @@ class PredictBatchUDFTests(SparkSessionTestCase):
         # multiple column input, single input => ERROR
         with self.assertRaisesRegex(Exception, "Multiple input columns found, but model expected"):
             preds = self.df.withColumn("preds", identity("a", "b")).toPandas()
+
+        # batch_size 1
+        identity = predict_batch_udf(make_predict_fn, return_type=DoubleType(), batch_size=1)
+        preds = self.df.withColumn("preds", identity("a")).toPandas()
+        self.assertTrue(preds["a"].equals(preds["preds"]))
 
     def test_identity_multi(self):
         # single input model
@@ -176,6 +194,10 @@ class PredictBatchUDFTests(SparkSessionTestCase):
         batch_sizes = preds["preds"].to_numpy()
         self.assertTrue(all(batch_sizes <= batch_size))
 
+    # TODO(SPARK-49793): enable the test below
+    @unittest.skipIf(
+        LooseVersion(np.__version__) >= LooseVersion("2"), "Caching does not work with numpy 2"
+    )
     def test_caching(self):
         def make_predict_fn():
             # emulate loading a model, this should only be invoked once (per worker process)
@@ -243,14 +265,14 @@ class PredictBatchUDFTests(SparkSessionTestCase):
         with self.assertRaisesRegex(Exception, "Model expected 3 inputs, but received 4 columns"):
             preds = self.df.withColumn("preds", sum_cols(*columns)).toPandas()
 
-        # muliple scalar columns with one tensor_input_shape => single numpy array
+        # multiple scalar columns with one tensor_input_shape => single numpy array
         sum_cols = predict_batch_udf(
             array_sum_fn, return_type=DoubleType(), batch_size=5, input_tensor_shapes=[[4]]
         )
         preds = self.df.withColumn("preds", sum_cols(struct(*columns))).toPandas()
         self.assertTrue(np.array_equal(np.sum(self.data, axis=1), preds["preds"].to_numpy()))
 
-        # muliple scalar columns with wrong tensor_input_shape => ERROR
+        # multiple scalar columns with wrong tensor_input_shape => ERROR
         sum_cols = predict_batch_udf(
             array_sum_fn, return_type=DoubleType(), batch_size=5, input_tensor_shapes=[[3]]
         )

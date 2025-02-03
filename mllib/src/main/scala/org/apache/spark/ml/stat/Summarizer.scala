@@ -29,8 +29,11 @@ import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{Expression, ImplicitCastInputTypes}
 import org.apache.spark.sql.catalyst.expressions.aggregate.TypedImperativeAggregate
 import org.apache.spark.sql.catalyst.trees.BinaryLike
+import org.apache.spark.sql.classic.ClassicConversions.ColumnConstructorExt
+import org.apache.spark.sql.classic.ExpressionUtils.expression
 import org.apache.spark.sql.functions.lit
 import org.apache.spark.sql.types._
+import org.apache.spark.util.Utils
 
 /**
  * A builder object that provides summary statistics about a given column.
@@ -247,16 +250,13 @@ private[ml] class SummaryBuilderImpl(
   ) extends SummaryBuilder {
 
   override def summary(featuresCol: Column, weightCol: Column): Column = {
-
-    val agg = SummaryBuilderImpl.MetricsAggregate(
+    Column(SummaryBuilderImpl.MetricsAggregate(
       requestedMetrics,
       requestedCompMetrics,
-      featuresCol.expr,
-      weightCol.expr,
+      expression(featuresCol),
+      expression(weightCol),
       mutableAggBufferOffset = 0,
-      inputAggBufferOffset = 0)
-
-    new Column(agg.toAggregateExpression())
+      inputAggBufferOffset = 0))
   }
 }
 
@@ -397,17 +397,12 @@ private[spark] object SummaryBuilderImpl extends Logging {
 
     override def serialize(state: SummarizerBuffer): Array[Byte] = {
       // TODO: Use ByteBuffer to optimize
-      val bos = new ByteArrayOutputStream()
-      val oos = new ObjectOutputStream(bos)
-      oos.writeObject(state)
-      bos.toByteArray
+      Utils.serialize(state)
     }
 
     override def deserialize(bytes: Array[Byte]): SummarizerBuffer = {
       // TODO: Use ByteBuffer to optimize
-      val bis = new ByteArrayInputStream(bytes)
-      val ois = new ObjectInputStream(bis)
-      ois.readObject().asInstanceOf[SummarizerBuffer]
+      Utils.deserialize(bytes)
     }
 
     override def withNewMutableAggBufferOffset(newMutableAggBufferOffset: Int): MetricsAggregate = {

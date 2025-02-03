@@ -24,12 +24,8 @@ import pandas as pd
 
 from pyspark import pandas as ps
 from pyspark.pandas.config import set_option, reset_option
-from pyspark.testing.pandasutils import (
-    have_matplotlib,
-    matplotlib_requirement_message,
-    PandasOnSparkTestCase,
-    TestUtils,
-)
+from pyspark.testing.pandasutils import PandasOnSparkTestCase, TestUtils
+from pyspark.testing.utils import have_matplotlib, matplotlib_requirement_message
 
 if have_matplotlib:
     import matplotlib
@@ -39,7 +35,7 @@ if have_matplotlib:
 
 
 @unittest.skipIf(not have_matplotlib, matplotlib_requirement_message)
-class SeriesPlotMatplotlibTest(PandasOnSparkTestCase, TestUtils):
+class SeriesPlotMatplotlibTestsMixin:
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
@@ -391,6 +387,10 @@ class SeriesPlotMatplotlibTest(PandasOnSparkTestCase, TestUtils):
         ax2 = psdf["single"].plot.hist()
         bin2 = self.plot_to_base64(ax2)
         self.assertEqual(bin1, bin2)
+
+
+class SeriesPlotMatplotlibTests(SeriesPlotMatplotlibTestsMixin, PandasOnSparkTestCase, TestUtils):
+    pass
 
 
 if __name__ == "__main__":

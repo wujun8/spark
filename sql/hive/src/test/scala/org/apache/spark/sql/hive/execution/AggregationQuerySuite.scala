@@ -22,8 +22,10 @@ import scala.util.Random
 import test.org.apache.spark.sql.MyDoubleAvg
 import test.org.apache.spark.sql.MyDoubleSum
 
-import org.apache.spark.sql._
+import org.apache.spark.sql.{AnalysisException, DataFrame, QueryTest, RandomDataGenerator, Row}
 import org.apache.spark.sql.catalyst.expressions.CodegenObjectFactoryMode
+import org.apache.spark.sql.classic.ClassicConversions.castToImpl
+import org.apache.spark.sql.classic.Dataset
 import org.apache.spark.sql.expressions.{MutableAggregationBuffer, UserDefinedAggregateFunction}
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.hive.test.TestHiveSingleton
@@ -517,16 +519,21 @@ abstract class AggregationQuerySuite extends QueryTest with SQLTestUtils with Te
   }
 
   test("non-deterministic children expressions of UDAF") {
-    val e = intercept[AnalysisException] {
-      spark.sql(
-        """
-          |SELECT mydoublesum(value + 1.5 * key + rand())
-          |FROM agg1
-          |GROUP BY key
-        """.stripMargin)
-    }.getMessage
-    assert(Seq("nondeterministic expression",
-      "should not appear in the arguments of an aggregate function").forall(e.contains))
+    checkError(
+      exception = intercept[AnalysisException] {
+        spark.sql(
+          """
+            |SELECT mydoublesum(value + 1.5 * key + rand())
+            |FROM agg1
+            |GROUP BY key
+          """.stripMargin)
+      },
+      condition = "AGGREGATE_FUNCTION_WITH_NONDETERMINISTIC_EXPRESSION",
+      parameters = Map("sqlExpr" -> "\"mydoublesum(((value + (1.5 * key)) + rand()))\""),
+      context = ExpectedContext(
+        fragment = "value + 1.5 * key + rand()",
+        start = 20,
+        stop = 45))
   }
 
   test("interpreted aggregate function") {
@@ -936,8 +943,10 @@ abstract class AggregationQuerySuite extends QueryTest with SQLTestUtils with Te
         data
           .find(r => r.getInt(0) == 50)
           .getOrElse(fail("A row with id 50 should be the expected answer."))
+
+      import org.apache.spark.util.ArrayImplicits._
       checkAnswer(
-        df.agg(udaf(allColumns: _*)),
+        df.agg(udaf(allColumns.toImmutableArraySeq: _*)),
         // udaf returns a Row as the output value.
         Row(expectedAnswer)
       )

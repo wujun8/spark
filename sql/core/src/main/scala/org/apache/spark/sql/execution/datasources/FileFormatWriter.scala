@@ -20,29 +20,27 @@ package org.apache.spark.sql.execution.datasources
 import java.util.{Date, UUID}
 
 import org.apache.hadoop.conf.Configuration
-import org.apache.hadoop.fs.{FileAlreadyExistsException, Path}
+import org.apache.hadoop.fs.Path
 import org.apache.hadoop.mapreduce._
 import org.apache.hadoop.mapreduce.lib.output.FileOutputFormat
 import org.apache.hadoop.mapreduce.task.TaskAttemptContextImpl
 
 import org.apache.spark._
-import org.apache.spark.internal.Logging
+import org.apache.spark.internal.{Logging, LogKeys, MDC}
+import org.apache.spark.internal.LogKeys._
 import org.apache.spark.internal.io.{FileCommitProtocol, SparkHadoopWriterUtils}
-import org.apache.spark.shuffle.FetchFailedException
-import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.catalog.BucketSpec
 import org.apache.spark.sql.catalyst.catalog.CatalogTypes.TablePartitionSpec
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.BindReferences.bindReferences
 import org.apache.spark.sql.catalyst.util.{CaseInsensitiveMap, DateTimeUtils}
+import org.apache.spark.sql.classic.SparkSession
 import org.apache.spark.sql.connector.write.WriterCommitMessage
-import org.apache.spark.sql.errors.QueryExecutionErrors
 import org.apache.spark.sql.execution.{ProjectExec, SortExec, SparkPlan, SQLExecution, UnsafeExternalRowSorter}
 import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanExec
-import org.apache.spark.sql.execution.command.DataWritingCommand
-import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.util.{SerializableConfiguration, Utils}
+import org.apache.spark.util.ArrayImplicits._
 
 
 /** A helper object for writing FileFormat data out to a location. */
@@ -123,49 +121,6 @@ object FileFormatWriter extends Logging {
     val outputWriterFactory =
       fileFormat.prepareWrite(sparkSession, job, caseInsensitiveOptions, dataSchema)
 
-    // SPARK-40588: when planned writing is disabled and AQE is enabled,
-    // plan contains an AdaptiveSparkPlanExec, which does not know
-    // its final plan's ordering, so we have to materialize that plan first
-    // it is fine to use plan further down as the final plan is cached in that plan
-    def materializeAdaptiveSparkPlan(plan: SparkPlan): SparkPlan = plan match {
-      case a: AdaptiveSparkPlanExec => a.finalPhysicalPlan
-      case p: SparkPlan => p.withNewChildren(p.children.map(materializeAdaptiveSparkPlan))
-    }
-
-    // We should first sort by dynamic partition columns, then bucket id, and finally sorting
-    // columns.
-    val requiredOrdering = partitionColumns.drop(numStaticPartitionCols) ++
-      writerBucketSpec.map(_.bucketIdExpression) ++ sortColumns
-    val writeFilesOpt = V1WritesUtils.getWriteFilesOpt(plan)
-    // the sort order doesn't matter
-    val actualOrdering = writeFilesOpt.map(_.child)
-      .getOrElse(materializeAdaptiveSparkPlan(plan))
-      .outputOrdering
-    val orderingMatched = V1WritesUtils.isOrderingMatched(requiredOrdering, actualOrdering)
-
-    // When `PLANNED_WRITE_ENABLED` is true, the optimizer rule V1Writes will add logical sort
-    // operator based on the required ordering of the V1 write command. So the output
-    // ordering of the physical plan should always match the required ordering. Here
-    // we set the variable to verify this behavior in tests.
-    // There are two cases where FileFormatWriter still needs to add physical sort:
-    // 1) When the planned write config is disabled.
-    // 2) When the concurrent writers are enabled (in this case the required ordering of a
-    //    V1 write command will be empty).
-    if (Utils.isTesting) outputOrderingMatched = orderingMatched
-
-    SQLExecution.checkSQLExecutionId(sparkSession)
-
-    val finalStatsTrackers = if (writeFilesOpt.isDefined) {
-      val writeFilesMetrics = writeFilesOpt.get.metrics
-      statsTrackers.map {
-        case tracker: BasicWriteJobStatsTracker =>
-          val finalMetrics = writeFilesMetrics ++ tracker.writeCommitMetrics()
-          DataWritingCommand.basicWriteJobStatsTracker(finalMetrics, hadoopConf)
-        case other => other
-      }
-    } else {
-      statsTrackers
-    }
     val description = new WriteJobDescription(
       uuid = UUID.randomUUID.toString,
       serializableHadoopConf = new SerializableConfiguration(job.getConfiguration),
@@ -180,12 +135,45 @@ object FileFormatWriter extends Logging {
         .getOrElse(sparkSession.sessionState.conf.maxRecordsPerFile),
       timeZoneId = caseInsensitiveOptions.get(DateTimeUtils.TIMEZONE_OPTION)
         .getOrElse(sparkSession.sessionState.conf.sessionLocalTimeZone),
-      statsTrackers = finalStatsTrackers
+      statsTrackers = statsTrackers
     )
+
+    // We should first sort by dynamic partition columns, then bucket id, and finally sorting
+    // columns.
+    val requiredOrdering = partitionColumns.drop(numStaticPartitionCols) ++
+        writerBucketSpec.map(_.bucketIdExpression) ++ sortColumns
+    val writeFilesOpt = V1WritesUtils.getWriteFilesOpt(plan)
+
+    // SPARK-40588: when planned writing is disabled and AQE is enabled,
+    // plan contains an AdaptiveSparkPlanExec, which does not know
+    // its final plan's ordering, so we have to materialize that plan first
+    // it is fine to use plan further down as the final plan is cached in that plan
+    def materializeAdaptiveSparkPlan(plan: SparkPlan): SparkPlan = plan match {
+      case a: AdaptiveSparkPlanExec => a.finalPhysicalPlan
+      case p: SparkPlan => p.withNewChildren(p.children.map(materializeAdaptiveSparkPlan))
+    }
+
+    // the sort order doesn't matter
+    val actualOrdering = writeFilesOpt.map(_.child)
+      .getOrElse(materializeAdaptiveSparkPlan(plan))
+      .outputOrdering
+    val orderingMatched = V1WritesUtils.isOrderingMatched(requiredOrdering, actualOrdering)
+
+    SQLExecution.checkSQLExecutionId(sparkSession)
 
     // propagate the description UUID into the jobs, so that committers
     // get an ID guaranteed to be unique.
     job.getConfiguration.set("spark.sql.sources.writeJobUUID", description.uuid)
+
+    // When `PLANNED_WRITE_ENABLED` is true, the optimizer rule V1Writes will add logical sort
+    // operator based on the required ordering of the V1 write command. So the output
+    // ordering of the physical plan should always match the required ordering. Here
+    // we set the variable to verify this behavior in tests.
+    // There are two cases where FileFormatWriter still needs to add physical sort:
+    // 1) When the planned write config is disabled.
+    // 2) When the concurrent writers are enabled (in this case the required ordering of a
+    //    V1 write command will be empty).
+    if (Utils.isTesting) outputOrderingMatched = orderingMatched
 
     if (writeFilesOpt.isDefined) {
       // build `WriteFilesSpec` for `WriteFiles`
@@ -242,7 +230,7 @@ object FileFormatWriter extends Logging {
       // SPARK-23271 If we are attempting to write a zero partition rdd, create a dummy single
       // partition rdd to make sure we at least set up one write task to write the metadata.
       val rddWithNonEmptyPartitions = if (rdd.partitions.length == 0) {
-        sparkSession.sparkContext.parallelize(Array.empty[InternalRow], 1)
+        sparkSession.sparkContext.parallelize(Array.empty[InternalRow].toImmutableArraySeq, 1)
       } else {
         rdd
       }
@@ -282,17 +270,20 @@ object FileFormatWriter extends Logging {
       val ret = f
       val commitMsgs = ret.map(_.commitMsg)
 
-      logInfo(s"Start to commit write Job ${description.uuid}.")
-      val (_, duration) = Utils.timeTakenMs { committer.commitJob(job, commitMsgs) }
-      logInfo(s"Write Job ${description.uuid} committed. Elapsed time: $duration ms.")
+      logInfo(log"Start to commit write Job ${MDC(LogKeys.UUID, description.uuid)}.")
+      val (_, duration) = Utils
+        .timeTakenMs { committer.commitJob(job, commitMsgs.toImmutableArraySeq) }
+      logInfo(log"Write Job ${MDC(LogKeys.UUID, description.uuid)} committed. " +
+        log"Elapsed time: ${MDC(LogKeys.ELAPSED_TIME, duration)} ms.")
 
-      processStats(description.statsTrackers, ret.map(_.summary.stats), duration)
-      logInfo(s"Finished processing stats for write job ${description.uuid}.")
+      processStats(
+        description.statsTrackers, ret.map(_.summary.stats).toImmutableArraySeq, duration)
+      logInfo(log"Finished processing stats for write job ${MDC(LogKeys.UUID, description.uuid)}.")
 
       // return a set of all the partition paths that were updated during this job
       ret.map(_.summary.updatedPartitions).reduceOption(_ ++ _).getOrElse(Set.empty)
     } catch { case cause: Throwable =>
-      logError(s"Aborting job ${description.uuid}.", cause)
+      logError(log"Aborting job ${MDC(WRITE_JOB_UUID, description.uuid)}.", cause)
       committer.abortJob(job)
       throw cause
     }
@@ -392,44 +383,42 @@ object FileFormatWriter extends Logging {
 
     committer.setupTask(taskAttemptContext)
 
-    val dataWriter =
-      if (sparkPartitionId != 0 && !iterator.hasNext) {
-        // In case of empty job, leave first partition to save meta for file format like parquet.
-        new EmptyDirectoryDataWriter(description, taskAttemptContext, committer)
-      } else if (description.partitionColumns.isEmpty && description.bucketSpec.isEmpty) {
-        new SingleDirectoryDataWriter(description, taskAttemptContext, committer)
-      } else {
-        concurrentOutputWriterSpec match {
-          case Some(spec) =>
-            new DynamicPartitionDataConcurrentWriter(
-              description, taskAttemptContext, committer, spec)
-          case _ =>
-            new DynamicPartitionDataSingleWriter(description, taskAttemptContext, committer)
-        }
-      }
+    var dataWriter: FileFormatDataWriter = null
 
-    try {
-      Utils.tryWithSafeFinallyAndFailureCallbacks(block = {
-        // Execute the task to write rows out and commit the task.
-        dataWriter.writeWithIterator(iterator)
-        dataWriter.commit()
-      })(catchBlock = {
-        // If there is an error, abort the task
+    Utils.tryWithSafeFinallyAndFailureCallbacks(block = {
+      dataWriter =
+        if (sparkPartitionId != 0 && !iterator.hasNext) {
+          // In case of empty job, leave first partition to save meta for file format like parquet.
+          new EmptyDirectoryDataWriter(description, taskAttemptContext, committer)
+        } else if (description.partitionColumns.isEmpty && description.bucketSpec.isEmpty) {
+          new SingleDirectoryDataWriter(description, taskAttemptContext, committer)
+        } else {
+          concurrentOutputWriterSpec match {
+            case Some(spec) =>
+              new DynamicPartitionDataConcurrentWriter(
+                description, taskAttemptContext, committer, spec)
+            case _ =>
+              new DynamicPartitionDataSingleWriter(description, taskAttemptContext, committer)
+          }
+        }
+
+      // Execute the task to write rows out and commit the task.
+      dataWriter.writeWithIterator(iterator)
+      dataWriter.commit()
+    })(catchBlock = {
+      // If there is an error, abort the task
+      if (dataWriter != null) {
         dataWriter.abort()
-        logError(s"Job $jobId aborted.")
-      }, finallyBlock = {
+      } else {
+        committer.abortTask(taskAttemptContext)
+      }
+      logError(log"Job: ${MDC(JOB_ID, jobId)}, Task: ${MDC(TASK_ID, taskId)}, " +
+        log"Task attempt ${MDC(TASK_ATTEMPT_ID, taskAttemptId)} aborted.")
+    }, finallyBlock = {
+      if (dataWriter != null) {
         dataWriter.close()
-      })
-    } catch {
-      case e: FetchFailedException =>
-        throw e
-      case f: FileAlreadyExistsException if SQLConf.get.fastFailFileFormatOutput =>
-        // If any output file to write already exists, it does not make sense to re-run this task.
-        // We throw the exception and let Executor throw ExceptionFailure to abort the job.
-        throw new TaskOutputFileAlreadyExistException(f)
-      case t: Throwable =>
-        throw QueryExecutionErrors.taskFailedWhileWritingRowsError(description.path, t)
-    }
+      }
+    })
   }
 
   /**

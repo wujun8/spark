@@ -17,10 +17,11 @@
 
 package org.apache.spark.sql.catalyst.expressions
 
+import org.apache.spark.QueryContext
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.codegen.{CodegenContext, CodeGenerator, ExprCode}
 import org.apache.spark.sql.catalyst.expressions.codegen.Block._
-import org.apache.spark.sql.catalyst.trees.SQLQueryContext
+import org.apache.spark.sql.catalyst.types.PhysicalDecimalType
 import org.apache.spark.sql.catalyst.util.TypeUtils
 import org.apache.spark.sql.errors.QueryExecutionErrors
 import org.apache.spark.sql.internal.SQLConf
@@ -31,8 +32,8 @@ import org.apache.spark.sql.types._
  * Note: this expression is internal and created only by the optimizer,
  * we don't need to do type check for it.
  */
-case class UnscaledValue(child: Expression) extends UnaryExpression with NullIntolerant {
-
+case class UnscaledValue(child: Expression) extends UnaryExpression {
+  override def nullIntolerant: Boolean = true
   override def dataType: DataType = LongType
   override def toString: String = s"UnscaledValue($child)"
 
@@ -56,7 +57,8 @@ case class MakeDecimal(
     child: Expression,
     precision: Int,
     scale: Int,
-    nullOnOverflow: Boolean) extends UnaryExpression with NullIntolerant {
+    nullOnOverflow: Boolean) extends UnaryExpression {
+  override def nullIntolerant: Boolean = true
 
   def this(child: Expression, precision: Int, scale: Int) = {
     this(child, precision, scale, !SQLConf.get.ansiEnabled)
@@ -145,7 +147,7 @@ case class CheckOverflow(
   override protected def withNewChildInternal(newChild: Expression): CheckOverflow =
     copy(child = newChild)
 
-  override def initQueryContext(): Option[SQLQueryContext] = if (!nullOnOverflow) {
+  override def initQueryContext(): Option[QueryContext] = if (!nullOnOverflow) {
     Some(origin.context)
   } else {
     None
@@ -157,7 +159,7 @@ case class CheckOverflowInSum(
     child: Expression,
     dataType: DecimalType,
     nullOnOverflow: Boolean,
-    context: SQLQueryContext) extends UnaryExpression with SupportQueryContext {
+    context: QueryContext) extends UnaryExpression with SupportQueryContext {
 
   override def nullable: Boolean = true
 
@@ -165,7 +167,9 @@ case class CheckOverflowInSum(
     val value = child.eval(input)
     if (value == null) {
       if (nullOnOverflow) null
-      else throw QueryExecutionErrors.overflowInSumOfDecimalError(context)
+      else {
+        throw QueryExecutionErrors.overflowInSumOfDecimalError(context, suggestedFunc = "try_sum")
+      }
     } else {
       value.asInstanceOf[Decimal].toPrecision(
         dataType.precision,
@@ -182,7 +186,7 @@ case class CheckOverflowInSum(
     val nullHandling = if (nullOnOverflow) {
       ""
     } else {
-      s"throw QueryExecutionErrors.overflowInSumOfDecimalError($errorContextCode);"
+      s"""throw QueryExecutionErrors.overflowInSumOfDecimalError($errorContextCode, "try_sum");"""
     }
     // scalastyle:off line.size.limit
     val code = code"""
@@ -209,7 +213,7 @@ case class CheckOverflowInSum(
   override protected def withNewChildInternal(newChild: Expression): CheckOverflowInSum =
     copy(child = newChild)
 
-  override def initQueryContext(): Option[SQLQueryContext] = Option(context)
+  override def initQueryContext(): Option[QueryContext] = Option(context)
 }
 
 /**
@@ -255,12 +259,12 @@ case class DecimalDivideWithOverflowCheck(
     left: Expression,
     right: Expression,
     override val dataType: DecimalType,
-    context: SQLQueryContext,
+    context: QueryContext,
     nullOnOverflow: Boolean)
   extends BinaryExpression with ExpectsInputTypes with SupportQueryContext {
   override def nullable: Boolean = nullOnOverflow
   override def inputTypes: Seq[AbstractDataType] = Seq(DecimalType, DecimalType)
-  override def initQueryContext(): Option[SQLQueryContext] = Option(context)
+  override def initQueryContext(): Option[QueryContext] = Option(context)
   def decimalMethod: String = "$div"
 
   override def eval(input: InternalRow): Any = {
@@ -269,11 +273,13 @@ case class DecimalDivideWithOverflowCheck(
       if (nullOnOverflow)  {
         null
       } else {
-        throw QueryExecutionErrors.overflowInSumOfDecimalError(getContextOrNull())
+        throw QueryExecutionErrors.overflowInSumOfDecimalError(getContextOrNull(),
+          suggestedFunc = "try_avg")
       }
     } else {
       val value2 = right.eval(input)
-      dataType.fractional.asInstanceOf[Fractional[Any]].div(value1, value2).asInstanceOf[Decimal]
+      PhysicalDecimalType(dataType.precision, dataType.scale)
+        .fractional.asInstanceOf[Fractional[Any]].div(value1, value2).asInstanceOf[Decimal]
         .toPrecision(dataType.precision, dataType.scale, Decimal.ROUND_HALF_UP, nullOnOverflow,
           getContextOrNull())
     }
@@ -284,7 +290,7 @@ case class DecimalDivideWithOverflowCheck(
     val nullHandling = if (nullOnOverflow) {
       ""
     } else {
-      s"throw QueryExecutionErrors.overflowInSumOfDecimalError($errorContextCode);"
+      s"""throw QueryExecutionErrors.overflowInSumOfDecimalError($errorContextCode, "try_avg");"""
     }
 
     val eval1 = left.genCode(ctx)

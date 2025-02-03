@@ -28,7 +28,7 @@ from typing import (
     TYPE_CHECKING,
 )
 
-from pyspark import keyword_only, since, SparkContext
+from pyspark import keyword_only, since
 from pyspark.ml.linalg import _convert_to_vector, DenseMatrix, DenseVector, Vector
 from pyspark.sql.dataframe import DataFrame
 from pyspark.ml.param.shared import (
@@ -50,9 +50,10 @@ from pyspark.ml.param.shared import (
     Param,
     Params,
 )
-from pyspark.ml.util import JavaMLReadable, JavaMLWritable
+from pyspark.ml.util import JavaMLReadable, JavaMLWritable, try_remote_attribute_relation
 from pyspark.ml.wrapper import JavaEstimator, JavaModel, JavaParams, JavaTransformer, _jvm
 from pyspark.ml.common import inherit_doc
+from pyspark.sql.utils import is_remote
 
 if TYPE_CHECKING:
     from py4j.java_gateway import JavaObject
@@ -104,6 +105,8 @@ __all__ = [
     "StopWordsRemover",
     "StringIndexer",
     "StringIndexerModel",
+    "TargetEncoder",
+    "TargetEncoderModel",
     "Tokenizer",
     "UnivariateFeatureSelector",
     "UnivariateFeatureSelectorModel",
@@ -385,6 +388,7 @@ class _LSHModel(JavaModel, _LSHParams):
         """
         return self._set(outputCol=value)
 
+    @try_remote_attribute_relation
     def approxNearestNeighbors(
         self,
         dataset: DataFrame,
@@ -422,6 +426,7 @@ class _LSHModel(JavaModel, _LSHParams):
         """
         return self._call_java("approxNearestNeighbors", dataset, key, numNearestNeighbors, distCol)
 
+    @try_remote_attribute_relation
     def approxSimilarityJoin(
         self,
         datasetA: DataFrame,
@@ -1202,9 +1207,11 @@ class CountVectorizerModel(
         Construct the model directly from a vocabulary list of strings,
         requires an active SparkContext.
         """
+        from pyspark.core.context import SparkContext
+
         sc = SparkContext._active_spark_context
         assert sc is not None and sc._gateway is not None
-        java_class = sc._gateway.jvm.java.lang.String
+        java_class = getattr(sc._gateway.jvm, "java.lang.String")
         jvocab = CountVectorizerModel._new_java_array(vocabulary, java_class)
         model = CountVectorizerModel._create_from_java_class(
             "org.apache.spark.ml.feature.CountVectorizerModel", jvocab
@@ -1219,7 +1226,7 @@ class CountVectorizerModel(
         model._set(vocabSize=len(vocabulary))
         return model
 
-    @property  # type: ignore[misc]
+    @property
     @since("1.6.0")
     def vocabulary(self) -> List[str]:
         """
@@ -1889,7 +1896,7 @@ class IDFModel(JavaModel, _IDFParams, JavaMLReadable["IDFModel"], JavaMLWritable
         """
         return self._set(outputCol=value)
 
-    @property  # type: ignore[misc]
+    @property
     @since("2.0.0")
     def idf(self) -> Vector:
         """
@@ -1897,7 +1904,7 @@ class IDFModel(JavaModel, _IDFParams, JavaMLReadable["IDFModel"], JavaMLWritable
         """
         return self._call_java("idf")
 
-    @property  # type: ignore[misc]
+    @property
     @since("3.0.0")
     def docFreq(self) -> List[int]:
         """
@@ -1905,7 +1912,7 @@ class IDFModel(JavaModel, _IDFParams, JavaMLReadable["IDFModel"], JavaMLWritable
         """
         return self._call_java("docFreq")
 
-    @property  # type: ignore[misc]
+    @property
     @since("3.0.0")
     def numDocs(self) -> int:
         """
@@ -2255,8 +2262,9 @@ class ImputerModel(JavaModel, _ImputerParams, JavaMLReadable["ImputerModel"], Ja
         """
         return self._set(outputCol=value)
 
-    @property  # type: ignore[misc]
+    @property
     @since("2.2.0")
+    @try_remote_attribute_relation
     def surrogateDF(self) -> DataFrame:
         """
         Returns a DataFrame containing inputCols and their corresponding surrogates,
@@ -2470,7 +2478,7 @@ class MaxAbsScalerModel(
         """
         return self._set(outputCol=value)
 
-    @property  # type: ignore[misc]
+    @property
     @since("2.0.0")
     def maxAbs(self) -> Vector:
         """
@@ -2820,7 +2828,7 @@ class MinMaxScalerModel(
         """
         return self._set(max=value)
 
-    @property  # type: ignore[misc]
+    @property
     @since("2.0.0")
     def originalMin(self) -> Vector:
         """
@@ -2828,7 +2836,7 @@ class MinMaxScalerModel(
         """
         return self._call_java("originalMin")
 
-    @property  # type: ignore[misc]
+    @property
     @since("2.0.0")
     def originalMax(self) -> Vector:
         """
@@ -3329,7 +3337,7 @@ class OneHotEncoderModel(
         """
         return self._set(handleInvalid=value)
 
-    @property  # type: ignore[misc]
+    @property
     @since("2.3.0")
     def categorySizes(self) -> List[int]:
         """
@@ -3747,6 +3755,23 @@ class QuantileDiscretizer(
         """
         Private method to convert the java_model to a Python model.
         """
+        if is_remote():
+            remote_model = JavaModel(java_model)
+            if self.isSet(self.inputCol):
+                return Bucketizer(
+                    splits=remote_model._call_java("getSplits"),
+                    inputCol=self.getInputCol(),
+                    outputCol=self.getOutputCol(),
+                    handleInvalid=self.getHandleInvalid(),
+                )
+            else:
+                return Bucketizer(
+                    splitsArray=remote_model._call_java("getSplitsArray"),
+                    inputCols=self.getInputCols(),
+                    outputCols=self.getOutputCols(),
+                    handleInvalid=self.getHandleInvalid(),
+                )
+
         if self.isSet(self.inputCol):
             return Bucketizer(
                 splits=list(java_model.getSplits()),
@@ -4007,7 +4032,7 @@ class RobustScalerModel(
         """
         return self._set(outputCol=value)
 
-    @property  # type: ignore[misc]
+    @property
     @since("3.0.0")
     def median(self) -> Vector:
         """
@@ -4015,7 +4040,7 @@ class RobustScalerModel(
         """
         return self._call_java("median")
 
-    @property  # type: ignore[misc]
+    @property
     @since("3.0.0")
     def range(self) -> Vector:
         """
@@ -4459,7 +4484,7 @@ class StandardScalerModel(
         """
         return self._set(outputCol=value)
 
-    @property  # type: ignore[misc]
+    @property
     @since("2.0.0")
     def std(self) -> Vector:
         """
@@ -4467,7 +4492,7 @@ class StandardScalerModel(
         """
         return self._call_java("std")
 
-    @property  # type: ignore[misc]
+    @property
     @since("2.0.0")
     def mean(self) -> Vector:
         """
@@ -4791,9 +4816,11 @@ class StringIndexerModel(
         Construct the model directly from an array of label strings,
         requires an active SparkContext.
         """
+        from pyspark.core.context import SparkContext
+
         sc = SparkContext._active_spark_context
         assert sc is not None and sc._gateway is not None
-        java_class = sc._gateway.jvm.java.lang.String
+        java_class = getattr(sc._gateway.jvm, "java.lang.String")
         jlabels = StringIndexerModel._new_java_array(labels, java_class)
         model = StringIndexerModel._create_from_java_class(
             "org.apache.spark.ml.feature.StringIndexerModel", jlabels
@@ -4818,9 +4845,11 @@ class StringIndexerModel(
         Construct the model directly from an array of array of label strings,
         requires an active SparkContext.
         """
+        from pyspark.core.context import SparkContext
+
         sc = SparkContext._active_spark_context
         assert sc is not None and sc._gateway is not None
-        java_class = sc._gateway.jvm.java.lang.String
+        java_class = getattr(sc._gateway.jvm, "java.lang.String")
         jlabels = StringIndexerModel._new_java_array(arrayOfLabels, java_class)
         model = StringIndexerModel._create_from_java_class(
             "org.apache.spark.ml.feature.StringIndexerModel", jlabels
@@ -4832,7 +4861,7 @@ class StringIndexerModel(
             model.setHandleInvalid(handleInvalid)
         return model
 
-    @property  # type: ignore[misc]
+    @property
     @since("1.5.0")
     def labels(self) -> List[str]:
         """
@@ -4843,7 +4872,7 @@ class StringIndexerModel(
         """
         return self._call_java("labels")
 
-    @property  # type: ignore[misc]
+    @property
     @since("3.0.2")
     def labelsArray(self) -> List[str]:
         """
@@ -4962,7 +4991,8 @@ class StopWordsRemover(
 
     Notes
     -----
-    null values from input array are preserved unless adding null to stopWords explicitly.
+    - null values from input array are preserved unless adding null to stopWords explicitly.
+    - In Spark Connect Mode, the default value of parameter `locale` is not set.
 
     Examples
     --------
@@ -5061,11 +5091,19 @@ class StopWordsRemover(
         self._java_obj = self._new_java_obj(
             "org.apache.spark.ml.feature.StopWordsRemover", self.uid
         )
-        self._setDefault(
-            stopWords=StopWordsRemover.loadDefaultStopWords("english"),
-            caseSensitive=False,
-            locale=self._java_obj.getLocale(),
-        )
+        if isinstance(self._java_obj, str):
+            # Skip setting the default value of 'locale', which needs to invoke a JVM method.
+            # So if users don't explicitly set 'locale', then getLocale fails.
+            self._setDefault(
+                stopWords=StopWordsRemover.loadDefaultStopWords("english"),
+                caseSensitive=False,
+            )
+        else:
+            self._setDefault(
+                stopWords=StopWordsRemover.loadDefaultStopWords("english"),
+                caseSensitive=False,
+                locale=self._java_obj.getLocale(),
+            )
         kwargs = self._input_kwargs
         self.setParams(**kwargs)
 
@@ -5190,8 +5228,298 @@ class StopWordsRemover(
         Supported languages: danish, dutch, english, finnish, french, german, hungarian,
         italian, norwegian, portuguese, russian, spanish, swedish, turkish
         """
-        stopWordsObj = _jvm().org.apache.spark.ml.feature.StopWordsRemover
+        stopWordsObj = getattr(_jvm(), "org.apache.spark.ml.feature.StopWordsRemover")
         return list(stopWordsObj.loadDefaultStopWords(language))
+
+
+class _TargetEncoderParams(
+    HasLabelCol, HasInputCol, HasInputCols, HasOutputCol, HasOutputCols, HasHandleInvalid
+):
+    """
+    Params for :py:class:`TargetEncoder` and :py:class:`TargetEncoderModel`.
+
+    .. versionadded:: 4.0.0
+    """
+
+    handleInvalid: Param[str] = Param(
+        Params._dummy(),
+        "handleInvalid",
+        "How to handle invalid data during transform(). "
+        + "Options are 'keep' (invalid data presented as an extra "
+        + "categorical feature) or error (throw an error).",
+        typeConverter=TypeConverters.toString,
+    )
+
+    targetType: Param[str] = Param(
+        Params._dummy(),
+        "targetType",
+        "whether the label is 'binary' or 'continuous'",
+        typeConverter=TypeConverters.toString,
+    )
+
+    smoothing: Param[float] = Param(
+        Params._dummy(),
+        "smoothing",
+        "value to smooth in-category averages with overall averages.",
+        typeConverter=TypeConverters.toFloat,
+    )
+
+    def __init__(self, *args: Any):
+        super(_TargetEncoderParams, self).__init__(*args)
+        self._setDefault(handleInvalid="error", targetType="binary", smoothing=0.0)
+
+    @since("4.0.0")
+    def getTargetType(self) -> str:
+        """
+        Gets the value of targetType or its default value.
+        """
+        return self.getOrDefault(self.targetType)
+
+    @since("4.0.0")
+    def getSmoothing(self) -> float:
+        """
+        Gets the value of smoothing or its default value.
+        """
+        return self.getOrDefault(self.smoothing)
+
+
+@inherit_doc
+class TargetEncoder(
+    JavaEstimator["TargetEncoderModel"],
+    _TargetEncoderParams,
+    JavaMLReadable["TargetEncoder"],
+    JavaMLWritable,
+):
+    """
+    Target Encoding maps a column of categorical indices into a numerical feature derived
+    from the target.
+
+    When :py:attr:`handleInvalid` is configured to 'keep', previously unseen values of
+    a feature are mapped to the dataset overall statistics.
+
+    When :py:attr:'targetType' is configured to 'binary', categories are encoded as the
+    conditional probability of the target given that category (bin counting).
+    When :py:attr:'targetType' is configured to 'continuous', categories are encoded as
+    the average of the target given that category (mean encoding)
+
+    Parameter :py:attr:'smoothing' controls how in-category stats and overall stats are
+    weighted to build the encodings
+
+    @note When encoding multi-column by using `inputCols` and `outputCols` params,
+    input/output cols come in pairs, specified by the order in the arrays, and each pair
+    is treated independently.
+
+    .. versionadded:: 4.0.0
+    """
+
+    _input_kwargs: Dict[str, Any]
+
+    @overload
+    def __init__(
+        self,
+        *,
+        inputCols: Optional[List[str]] = ...,
+        outputCols: Optional[List[str]] = ...,
+        labelCol: str = ...,
+        handleInvalid: str = ...,
+        targetType: str = ...,
+        smoothing: float = ...,
+    ):
+        ...
+
+    @overload
+    def __init__(
+        self,
+        *,
+        labelCol: str = ...,
+        handleInvalid: str = ...,
+        targetType: str = ...,
+        smoothing: float = ...,
+        inputCol: Optional[str] = ...,
+        outputCol: Optional[str] = ...,
+    ):
+        ...
+
+    @keyword_only
+    def __init__(
+        self,
+        *,
+        inputCols: Optional[List[str]] = None,
+        outputCols: Optional[List[str]] = None,
+        labelCol: str = "label",
+        handleInvalid: str = "error",
+        targetType: str = "binary",
+        smoothing: float = 0.0,
+        inputCol: Optional[str] = None,
+        outputCol: Optional[str] = None,
+    ):
+        """
+        __init__(self, \\*, inputCols=None, outputCols=None, handleInvalid="error", dropLast=True, \
+                 targetType="binary", smoothing=0.0, inputCol=None, outputCol=None)
+        """
+        super(TargetEncoder, self).__init__()
+        self._java_obj = self._new_java_obj("org.apache.spark.ml.feature.TargetEncoder", self.uid)
+        kwargs = self._input_kwargs
+        self.setParams(**kwargs)
+
+    @overload
+    def setParams(
+        self,
+        *,
+        inputCols: Optional[List[str]] = ...,
+        outputCols: Optional[List[str]] = ...,
+        labelCol: str = ...,
+        handleInvalid: str = ...,
+        targetType: str = ...,
+        smoothing: float = ...,
+    ) -> "TargetEncoder":
+        ...
+
+    @overload
+    def setParams(
+        self,
+        *,
+        labelCol: str = ...,
+        handleInvalid: str = ...,
+        targetType: str = ...,
+        smoothing: float = ...,
+        inputCol: Optional[str] = ...,
+        outputCol: Optional[str] = ...,
+    ) -> "TargetEncoder":
+        ...
+
+    @keyword_only
+    @since("4.0.0")
+    def setParams(
+        self,
+        *,
+        inputCols: Optional[List[str]] = None,
+        outputCols: Optional[List[str]] = None,
+        labelCol: str = "label",
+        handleInvalid: str = "error",
+        targetType: str = "binary",
+        smoothing: float = 0.0,
+        inputCol: Optional[str] = None,
+        outputCol: Optional[str] = None,
+    ) -> "TargetEncoder":
+        """
+        setParams(self, \\*, inputCols=None, outputCols=None, handleInvalid="error", \
+                  dropLast=True, inputCol=None, outputCol=None)
+        Sets params for this TargetEncoder.
+        """
+        kwargs = self._input_kwargs
+        return self._set(**kwargs)
+
+    @since("4.0.0")
+    def setLabelCol(self, value: str) -> "TargetEncoder":
+        """
+        Sets the value of :py:attr:`labelCol`.
+        """
+        return self._set(labelCol=value)
+
+    @since("4.0.0")
+    def setInputCols(self, value: List[str]) -> "TargetEncoder":
+        """
+        Sets the value of :py:attr:`inputCols`.
+        """
+        return self._set(inputCols=value)
+
+    @since("4.0.0")
+    def setOutputCols(self, value: List[str]) -> "TargetEncoder":
+        """
+        Sets the value of :py:attr:`outputCols`.
+        """
+        return self._set(outputCols=value)
+
+    @since("4.0.0")
+    def setInputCol(self, value: str) -> "TargetEncoder":
+        """
+        Sets the value of :py:attr:`inputCol`.
+        """
+        return self._set(inputCol=value)
+
+    @since("4.0.0")
+    def setOutputCol(self, value: str) -> "TargetEncoder":
+        """
+        Sets the value of :py:attr:`outputCol`.
+        """
+        return self._set(outputCol=value)
+
+    @since("4.0.0")
+    def setHandleInvalid(self, value: str) -> "TargetEncoder":
+        """
+        Sets the value of :py:attr:`handleInvalid`.
+        """
+        return self._set(handleInvalid=value)
+
+    @since("4.0.0")
+    def setTargetType(self, value: str) -> "TargetEncoder":
+        """
+        Sets the value of :py:attr:`targetType`.
+        """
+        return self._set(targetType=value)
+
+    @since("4.0.0")
+    def setSmoothing(self, value: float) -> "TargetEncoder":
+        """
+        Sets the value of :py:attr:`smoothing`.
+        """
+        return self._set(smoothing=value)
+
+    def _create_model(self, java_model: "JavaObject") -> "TargetEncoderModel":
+        return TargetEncoderModel(java_model)
+
+
+class TargetEncoderModel(
+    JavaModel, _TargetEncoderParams, JavaMLReadable["TargetEncoderModel"], JavaMLWritable
+):
+    """
+    Model fitted by :py:class:`TargetEncoder`.
+
+    .. versionadded:: 4.0.0
+    """
+
+    @since("4.0.0")
+    def setInputCols(self, value: List[str]) -> "TargetEncoderModel":
+        """
+        Sets the value of :py:attr:`inputCols`.
+        """
+        return self._set(inputCols=value)
+
+    @since("4.0.0")
+    def setOutputCols(self, value: List[str]) -> "TargetEncoderModel":
+        """
+        Sets the value of :py:attr:`outputCols`.
+        """
+        return self._set(outputCols=value)
+
+    @since("4.0.0")
+    def setInputCol(self, value: str) -> "TargetEncoderModel":
+        """
+        Sets the value of :py:attr:`inputCol`.
+        """
+        return self._set(inputCol=value)
+
+    @since("4.0.0")
+    def setOutputCol(self, value: str) -> "TargetEncoderModel":
+        """
+        Sets the value of :py:attr:`outputCol`.
+        """
+        return self._set(outputCol=value)
+
+    @since("4.0.0")
+    def setHandleInvalid(self, value: str) -> "TargetEncoderModel":
+        """
+        Sets the value of :py:attr:`handleInvalid`.
+        """
+        return self._set(handleInvalid=value)
+
+    @since("4.0.0")
+    def setSmoothing(self, value: float) -> "TargetEncoderModel":
+        """
+        Sets the value of :py:attr:`smoothing`.
+        """
+        return self._set(smoothing=value)
 
 
 @inherit_doc
@@ -5313,7 +5641,7 @@ class VectorAssembler(
     +---+---+----+-------------+
     |  a|  b|   c|     features|
     +---+---+----+-------------+
-    |1.0|2.0|null|[1.0,2.0,NaN]|
+    |1.0|2.0|NULL|[1.0,2.0,NaN]|
     |3.0|NaN| 4.0|[3.0,NaN,4.0]|
     |5.0|6.0| 7.0|[5.0,6.0,7.0]|
     +---+---+----+-------------+
@@ -5627,7 +5955,7 @@ class VectorIndexerModel(
         """
         return self._set(outputCol=value)
 
-    @property  # type: ignore[misc]
+    @property
     @since("1.4.0")
     def numFeatures(self) -> int:
         """
@@ -5635,7 +5963,7 @@ class VectorIndexerModel(
         """
         return self._call_java("numFeatures")
 
-    @property  # type: ignore[misc]
+    @property
     @since("1.4.0")
     def categoryMaps(self) -> Dict[int, Tuple[float, int]]:
         """
@@ -6074,6 +6402,7 @@ class Word2VecModel(JavaModel, _Word2VecParams, JavaMLReadable["Word2VecModel"],
     """
 
     @since("1.5.0")
+    @try_remote_attribute_relation
     def getVectors(self) -> DataFrame:
         """
         Returns the vector representation of the words as a dataframe
@@ -6094,6 +6423,7 @@ class Word2VecModel(JavaModel, _Word2VecParams, JavaMLReadable["Word2VecModel"],
         return self._set(outputCol=value)
 
     @since("1.5.0")
+    @try_remote_attribute_relation
     def findSynonyms(self, word: Union[str, Vector], num: int) -> DataFrame:
         """
         Find "num" number of words closest in similarity to "word".
@@ -6263,7 +6593,7 @@ class PCAModel(JavaModel, _PCAParams, JavaMLReadable["PCAModel"], JavaMLWritable
         """
         return self._set(outputCol=value)
 
-    @property  # type: ignore[misc]
+    @property
     @since("2.0.0")
     def pc(self) -> DenseMatrix:
         """
@@ -6272,7 +6602,7 @@ class PCAModel(JavaModel, _PCAParams, JavaMLReadable["PCAModel"], JavaMLWritable
         """
         return self._call_java("pc")
 
-    @property  # type: ignore[misc]
+    @property
     @since("2.0.0")
     def explainedVariance(self) -> DenseVector:
         """
@@ -6529,7 +6859,7 @@ class RFormulaModel(JavaModel, _RFormulaParams, JavaMLReadable["RFormulaModel"],
     """
 
     def __str__(self) -> str:
-        resolvedFormula = self._call_java("resolvedFormula")
+        resolvedFormula = self._call_java("resolvedFormulaString")
         return "RFormulaModel(%s) (uid=%s)" % (resolvedFormula, self.uid)
 
 
@@ -6729,7 +7059,7 @@ class _SelectorModel(JavaModel, _SelectorParams):
         """
         return self._set(outputCol=value)
 
-    @property  # type: ignore[misc]
+    @property
     @since("2.0.0")
     def selectedFeatures(self) -> List[int]:
         """
@@ -7144,7 +7474,7 @@ class VarianceThresholdSelectorModel(
         """
         return self._set(outputCol=value)
 
-    @property  # type: ignore[misc]
+    @property
     @since("3.1.0")
     def selectedFeatures(self) -> List[int]:
         """
@@ -7419,7 +7749,7 @@ class UnivariateFeatureSelectorModel(
         """
         return self._set(outputCol=value)
 
-    @property  # type: ignore[misc]
+    @property
     @since("3.1.1")
     def selectedFeatures(self) -> List[int]:
         """

@@ -25,7 +25,7 @@ import org.apache.spark.sql.types._
 
 class DataTypeParserSuite extends SparkFunSuite with SQLHelper {
 
-  def parse(sql: String): DataType = CatalystSqlParser.parseDataType(sql)
+  def parse(sql: String): DataType = DataTypeParser.parseDataType(sql)
 
   def checkDataType(dataTypeString: String, expectedDataType: DataType): Unit = {
     test(s"parse ${dataTypeString.replace("\n", "")}") {
@@ -138,12 +138,12 @@ class DataTypeParserSuite extends SparkFunSuite with SQLHelper {
   test("Do not print empty parentheses for no params") {
     checkError(
       exception = intercept("unknown"),
-      errorClass = "UNSUPPORTED_DATATYPE",
+      condition = "UNSUPPORTED_DATATYPE",
       parameters = Map("typeName" -> "\"UNKNOWN\"")
     )
     checkError(
       exception = intercept("unknown(1,2,3)"),
-      errorClass = "UNSUPPORTED_DATATYPE",
+      condition = "UNSUPPORTED_DATATYPE",
       parameters = Map("typeName" -> "\"UNKNOWN(1,2,3)\"")
     )
   }

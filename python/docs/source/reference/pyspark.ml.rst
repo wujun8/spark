@@ -104,6 +104,8 @@ Feature
     StopWordsRemover
     StringIndexer
     StringIndexerModel
+    TargetEncoder
+    TargetEncoderModel
     Tokenizer
     UnivariateFeatureSelector
     UnivariateFeatureSelectorModel
@@ -351,6 +353,13 @@ Distributor
     :toctree: api/
 
     TorchDistributor
+
+.. currentmodule:: pyspark.ml.deepspeed.deepspeed_distributor
+.. autosummary::
+    :template: autosummary/class_with_docs.rst
+    :toctree: api/
+
+    DeepspeedTorchDistributor
 
 
 Utilities

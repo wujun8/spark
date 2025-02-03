@@ -19,19 +19,19 @@ package org.apache.spark.sql.hive.execution
 
 import org.apache.hadoop.fs.{FileSystem, Path}
 import org.apache.hadoop.hive.common.FileUtils
+import org.apache.hadoop.hive.ql.plan.FileSinkDesc
 import org.apache.hadoop.hive.ql.plan.TableDesc
 import org.apache.hadoop.hive.serde.serdeConstants
 import org.apache.hadoop.hive.serde2.`lazy`.LazySimpleSerDe
 
 import org.apache.spark.SparkException
-import org.apache.spark.sql.{Row, SparkSession}
+import org.apache.spark.sql.Row
 import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.catalog.{CatalogStorageFormat, CatalogTable}
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
+import org.apache.spark.sql.classic.SparkSession
 import org.apache.spark.sql.execution.SparkPlan
 import org.apache.spark.sql.execution.command.DDLUtils
-import org.apache.spark.sql.execution.datasources.BasicWriteJobStatsTracker
-import org.apache.spark.sql.execution.metric.SQLMetric
 import org.apache.spark.sql.hive.client.HiveClientImpl
 import org.apache.spark.sql.util.SchemaUtils
 
@@ -58,11 +58,6 @@ case class InsertIntoHiveDirCommand(
     query: LogicalPlan,
     overwrite: Boolean,
     outputColumnNames: Seq[String]) extends SaveAsHiveFile with V1WritesHiveUtils {
-
-  // We did not pull out `InsertIntoHiveDirCommand` to `V1WriteCommand`,
-  // so there is no `WriteFiles`. It should always hold all metrics by itself.
-  override lazy val metrics: Map[String, SQLMetric] =
-    BasicWriteJobStatsTracker.metrics
 
   override def run(sparkSession: SparkSession, child: SparkPlan): Seq[Row] = {
     assert(storage.locationUri.nonEmpty)
@@ -108,8 +103,7 @@ case class InsertIntoHiveDirCommand(
     // The temporary path must be a HDFS path, not a local path.
     val hiveTempPath = new HiveTempPath(sparkSession, hadoopConf, qualifiedPath)
     val tmpPath = hiveTempPath.externalTempPath
-    val fileSinkConf = new org.apache.spark.sql.hive.HiveShim.ShimFileSinkDesc(
-      tmpPath.toString, tableDesc, false)
+    val fileSinkConf = new FileSinkDesc(tmpPath, tableDesc, false)
     setupHadoopConfForCompression(fileSinkConf, hadoopConf, sparkSession)
     hiveTempPath.createTmpPath()
 
