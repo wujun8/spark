@@ -35,6 +35,11 @@ if should_test_connect:
 
 @unittest.skipIf(not should_test_connect, connect_requirement_message)
 class SparkSessionTestCase(unittest.TestCase):
+    def setUp(self):
+        # Reset class-level session state so tests are order-independent.
+        RemoteSparkSession._default_session = None
+        RemoteSparkSession._active_session.session = None
+
     def test_fails_to_create_session_without_remote_and_channel_builder(self):
         with self.assertRaises(ValueError):
             RemoteSparkSession.builder.getOrCreate()
@@ -52,6 +57,8 @@ class SparkSessionTestCase(unittest.TestCase):
             CustomChannelBuilder("sc://other")
         ).getOrCreate()
         host = test_session.client.host
+        # Skip release_session() since "sc://other" is a fake remote.
+        test_session.release_session_on_close = False
         test_session.stop()
 
         self.assertEqual("other", host)
@@ -59,12 +66,14 @@ class SparkSessionTestCase(unittest.TestCase):
     def test_creates_session_with_remote(self):
         test_session = RemoteSparkSession.builder.remote("sc://other").getOrCreate()
         host = test_session.client.host
+        test_session.release_session_on_close = False
         test_session.stop()
 
         self.assertEqual("other", host)
 
     def test_session_stop(self):
         session = RemoteSparkSession.builder.remote("sc://other").getOrCreate()
+        session.release_session_on_close = False
 
         self.assertFalse(session.is_stopped)
         session.stop()
@@ -75,6 +84,7 @@ class SparkSessionTestCase(unittest.TestCase):
         session2 = RemoteSparkSession.builder.remote("sc://other").getOrCreate()
 
         self.assertIs(session, session2)
+        session.release_session_on_close = False
         session.stop()
 
     def test_active_session_expires_when_client_closes(self):
@@ -93,14 +103,20 @@ class SparkSessionTestCase(unittest.TestCase):
 
     def test_default_session_expires_when_client_closes(self):
         s1 = RemoteSparkSession.builder.remote("sc://other").getOrCreate()
-        s2 = RemoteSparkSession.getDefaultSession()
+        s2 = RemoteSparkSession._get_default_session()
 
         self.assertIs(s1, s2)
 
         # We don't call close() to avoid executing ExecutePlanResponseReattachableIterator
         s1._client._closed = True
 
-        self.assertIsNone(RemoteSparkSession.getDefaultSession())
+        self.assertIsNone(RemoteSparkSession._get_default_session())
         s3 = RemoteSparkSession.builder.remote("sc://other").getOrCreate()
 
         self.assertIsNot(s1, s3)
+
+
+if __name__ == "__main__":
+    from pyspark.testing import main
+
+    main()
