@@ -351,6 +351,33 @@ class Analyzer(
     }
   }
 
+  /**
+   * Returns a copy of this analyzer that uses the given [[CatalogManager]] for all catalog
+   * lookups. All other configuration (extended rules, checks, etc.) is preserved. Used by
+   * [[QueryExecution]] to create a per-query analyzer for transactional operations for
+   * transaction-aware catalog resolution.
+   *
+   * IMPORTANT: any new extension point added to Analyzer must also be copied here, otherwise
+   * transaction-aware analyzer clones (created by QueryExecution) will silently miss those rules.
+   */
+  def withCatalogManager(newCatalogManager: CatalogManager): Analyzer = {
+    val self = this
+    new Analyzer(newCatalogManager, sharedRelationCache) {
+      override val hintResolutionRules: Seq[Rule[LogicalPlan]] = self.hintResolutionRules
+      override val extendedResolutionRules: Seq[Rule[LogicalPlan]] = self.extendedResolutionRules
+      override val postHocResolutionRules: Seq[Rule[LogicalPlan]] = self.postHocResolutionRules
+      override val extendedCheckRules: Seq[LogicalPlan => Unit] = self.extendedCheckRules
+      override val singlePassResolverExtensions: Seq[ResolverExtension] =
+        self.singlePassResolverExtensions
+      override val singlePassMetadataResolverExtensions: Seq[ResolverExtension] =
+        self.singlePassMetadataResolverExtensions
+      override val singlePassPostHocResolutionRules: Seq[Rule[LogicalPlan]] =
+        self.singlePassPostHocResolutionRules
+      override val singlePassExtendedResolutionChecks: Seq[LogicalPlan => Unit] =
+        self.singlePassExtendedResolutionChecks
+    }
+  }
+
   override def execute(plan: LogicalPlan): LogicalPlan = {
     AnalysisContext.withNewAnalysisContext {
       executeSameContext(plan)
@@ -458,7 +485,9 @@ class Analyzer(
     Batch("Simple Sanity Check", Once,
       LookupFunctions),
     Batch("Keep Legacy Outputs", Once,
-      KeepLegacyOutputs)
+      KeepLegacyOutputs),
+    Batch("Unresolve Relations", Once,
+      new UnresolveRelationsInTransaction(catalogManager))
   )
 
   override def batches: Seq[Batch] = earlyBatches ++ Seq(
@@ -1015,7 +1044,7 @@ class Analyzer(
       // DataSourceV2Relation on each view access. Only dataframe temp view may contain it
       // as it stores resolved plans directly.
       case view: View if view.isTempViewStoringAnalyzedPlan =>
-        view.copy(child = resolveTableReferences(view.child))
+        view.copy(child = resolveTableReferencesInTempView(view.child))
       case p @ SubqueryAlias(_, view: View) =>
         p.copy(child = resolveViews(view, options))
       case _ => plan
@@ -1024,17 +1053,43 @@ class Analyzer(
     // Unwrap temp views storing analyzed plans and resolve V2TableReference nodes in the child.
     private def unwrapRelationPlan(plan: LogicalPlan): LogicalPlan = {
       EliminateSubqueryAliases(plan) match {
-        case v: View if v.isTempViewStoringAnalyzedPlan => resolveTableReferences(v.child)
+        case v: View if v.isTempViewStoringAnalyzedPlan => resolveTableReferencesInTempView(v.child)
         case other => other
       }
     }
 
-    // Resolve V2TableReference nodes in a plan. V2TableReference is only created for temp views
-    // (via V2TableReference.createForTempView), so we only need to resolve it when returning
+    // Resolve the write target of a V2 write command (batch or streaming).
+    private def resolveWriteTarget(
+        write: LogicalPlan,
+        table: NamedRelation,
+        withNewTable: NamedRelation => LogicalPlan): LogicalPlan = {
+      table match {
+        case u: UnresolvedRelation if !u.isStreaming =>
+          resolveRelation(u).map(unwrapRelationPlan).map {
+            case v: View => throw QueryCompilationErrors.writeIntoViewNotAllowedError(
+              v.desc.identifier, write)
+            case u: UnresolvedCatalogRelation =>
+              throw QueryCompilationErrors.writeIntoV1TableNotAllowedError(
+                u.tableMeta.identifier, write)
+            case r: DataSourceV2Relation => withNewTable(r)
+            case _ =>
+              throw QueryCompilationErrors.writeIntoTempViewNotAllowedError(
+                u.multipartIdentifier.quoted)
+          }.getOrElse(write)
+        case _ => write
+      }
+    }
+
+    // Resolve V2TableReference nodes inside temp view plans. These are created by
+    // V2TableReference.createForTempView. We only need to resolve it when returning
     // the plan of temp views (in resolveViews and unwrapRelationPlan).
-    private def resolveTableReferences(plan: LogicalPlan): LogicalPlan = {
+    private def resolveTableReferencesInTempView(plan: LogicalPlan): LogicalPlan = {
       plan.resolveOperatorsUp {
-        case r: V2TableReference => relationResolution.resolveReference(r)
+        case r: V2TableReference =>
+          assert(r.context.isInstanceOf[V2TableReference.TemporaryViewContext],
+            s"""Expected TemporaryViewContext in temp view but got
+               |${r.context.getClass.getSimpleName}""".stripMargin)
+          relationResolution.resolveReference(r)
       }
     }
 
@@ -1057,23 +1112,11 @@ class Analyzer(
           case other => i.copy(table = other)
         }
 
-      // TODO (SPARK-27484): handle streaming write commands when we have them.
+      case write: StreamingV2WriteCommand =>
+        resolveWriteTarget(write, write.table, write.withNewTable)
+
       case write: V2WriteCommand =>
-        write.table match {
-          case u: UnresolvedRelation if !u.isStreaming =>
-            resolveRelation(u).map(unwrapRelationPlan).map {
-              case v: View => throw QueryCompilationErrors.writeIntoViewNotAllowedError(
-                v.desc.identifier, write)
-              case u: UnresolvedCatalogRelation =>
-                throw QueryCompilationErrors.writeIntoV1TableNotAllowedError(
-                  u.tableMeta.identifier, write)
-              case r: DataSourceV2Relation => write.withNewTable(r)
-              case _ =>
-                throw QueryCompilationErrors.writeIntoTempViewNotAllowedError(
-                  u.multipartIdentifier.quoted)
-            }.getOrElse(write)
-          case _ => write
-        }
+        resolveWriteTarget(write, write.table, write.withNewTable)
 
       case u: UnresolvedRelation =>
         resolveRelation(u).map(resolveViews(_, u.options)).getOrElse(u)
