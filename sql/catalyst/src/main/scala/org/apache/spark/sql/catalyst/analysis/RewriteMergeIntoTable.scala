@@ -295,12 +295,7 @@ object RewriteMergeIntoTable extends RewriteRowLevelCommand with PredicateHelper
     // build a plan to write the row delta to the table
     val writeRelation = relation.copy(table = operationTable)
     val projections = buildWriteDeltaProjections(mergeRowsPlan, rowAttrs, rowIdAttrs, metadataAttrs)
-    val groupFilterCond = if (notMatchedBySourceActions.isEmpty && groupFilterEnabled) {
-      Some(toGroupFilterCondition(relation, source, cond))
-    } else {
-      None
-    }
-    WriteDelta(writeRelation, cond, mergeRowsPlan, relation, projections, groupFilterCond)
+    WriteDelta(writeRelation, cond, mergeRowsPlan, relation, projections)
   }
 
   private def chooseWriteDeltaJoinType(
