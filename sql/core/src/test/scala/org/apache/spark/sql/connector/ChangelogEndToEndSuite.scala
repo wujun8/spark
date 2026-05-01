@@ -25,7 +25,8 @@ import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.analysis.NamedStreamingRelation
 import org.apache.spark.sql.catalyst.streaming.UserProvided
 import org.apache.spark.sql.connector.catalog._
-import org.apache.spark.sql.connector.catalog.Changelog.{CHANGE_TYPE_DELETE, CHANGE_TYPE_INSERT}
+import org.apache.spark.sql.connector.catalog.Changelog.{
+  CHANGE_TYPE_DELETE, CHANGE_TYPE_INSERT, CHANGE_TYPE_UPDATE_POSTIMAGE, CHANGE_TYPE_UPDATE_PREIMAGE}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.test.SharedSparkSession
 import org.apache.spark.sql.types.{LongType, StringType}
@@ -661,5 +662,234 @@ class ChangelogEndToEndSuite extends SharedSparkSession {
         .changes(fullTableName)
     }
     assert(e.getMessage.contains("changes"))
+  }
+
+  // ---------- Streaming: row-level post-processing ----------
+  //
+  // Streaming row-level passes (carry-over removal, update detection) rewrite the plan
+  // into Aggregate(rowId, _commit_version, _commit_timestamp) -> [Filter] ->
+  // Generate(Inline(events)) -> [relabel Project], under an EventTimeWatermark on
+  // _commit_timestamp.
+
+  /** Schema variant for post-processing tests: includes `row_commit_version`. */
+  private def recreateWithRowVersion(): Identifier = {
+    val id = ident
+    val cat = catalog
+    if (cat.tableExists(id)) cat.dropTable(id)
+    cat.createTable(
+      id,
+      Array(
+        Column.create("id", LongType, false),
+        Column.create("data", StringType),
+        Column.create("row_commit_version", LongType, false)),
+      Array.empty,
+      new util.HashMap[String, String]())
+    cat.clearChangeRows(id)
+    id
+  }
+
+  /** Row constructor for the row-version-enabled schema. */
+  private def ppRow(
+      id: Long,
+      data: String,
+      rcv: Long,
+      changeType: String,
+      commitVersion: Long,
+      commitTimestampMicros: Long): InternalRow = {
+    InternalRow(
+      id,
+      UTF8String.fromString(data),
+      rcv,
+      UTF8String.fromString(changeType),
+      commitVersion,
+      commitTimestampMicros)
+  }
+
+  test("streaming carry-over removal drops CoW pairs") {
+    val id = recreateWithRowVersion()
+    catalog.setChangelogProperties(id, ChangelogProperties(
+      containsCarryoverRows = true,
+      rowIdNames = Seq("id"),
+      rowVersionName = Some("row_commit_version")))
+
+    catalog.addChangeRows(id, Seq(
+      // v1: insert Alice (rcv=1), Bob (rcv=1)
+      ppRow(1L, "Alice", 1L, CHANGE_TYPE_INSERT, 1L, 1000000L),
+      ppRow(2L, "Bob", 1L, CHANGE_TYPE_INSERT, 1L, 1000000L),
+      // v2: real delete Alice + carry-over for Bob (rcv unchanged)
+      ppRow(1L, "Alice", 1L, CHANGE_TYPE_DELETE, 2L, 2000000L),
+      ppRow(2L, "Bob", 1L, CHANGE_TYPE_DELETE, 2L, 2000000L),
+      ppRow(2L, "Bob", 1L, CHANGE_TYPE_INSERT, 2L, 2000000L)))
+
+    val q = spark.readStream
+      .option("startingVersion", "1")
+      .changes(fullTableName)
+      .select("id", "data", "_change_type", "_commit_version")
+      .writeStream
+      .format("memory")
+      .queryName("cdc_stream_carryover")
+      .outputMode("append")
+      .start()
+    try {
+      q.processAllAvailable()
+      // The next micro-batch advances the input watermark to the max _commit_timestamp
+      // seen in the previous batch; append-mode aggregate eviction (eventTime <= watermark)
+      // then emits all groups including the highest commit. v1 inserts + Alice's real
+      // delete survive; Bob's carry-over pair at v2 is dropped.
+      checkAnswer(
+        spark.sql("SELECT * FROM cdc_stream_carryover"),
+        Seq(
+          Row(1L, "Alice", CHANGE_TYPE_INSERT, 1L),
+          Row(2L, "Bob", CHANGE_TYPE_INSERT, 1L),
+          Row(1L, "Alice", CHANGE_TYPE_DELETE, 2L)))
+    } finally {
+      q.stop()
+    }
+  }
+
+  test("streaming update detection relabels delete+insert as update") {
+    val id = recreateWithRowVersion()
+    catalog.setChangelogProperties(id, ChangelogProperties(
+      representsUpdateAsDeleteAndInsert = true,
+      rowIdNames = Seq("id"),
+      rowVersionName = Some("row_commit_version")))
+
+    catalog.addChangeRows(id, Seq(
+      // v1: insert Alice (rcv=1)
+      ppRow(1L, "Alice", 1L, CHANGE_TYPE_INSERT, 1L, 1000000L),
+      // v2: real update Alice -> Robert (delete old, insert new)
+      ppRow(1L, "Alice", 1L, CHANGE_TYPE_DELETE, 2L, 2000000L),
+      ppRow(1L, "Robert", 2L, CHANGE_TYPE_INSERT, 2L, 2000000L)))
+
+    val q = spark.readStream
+      .option("startingVersion", "1")
+      .option("computeUpdates", "true")
+      .option("deduplicationMode", "none")
+      .changes(fullTableName)
+      .select("id", "data", "_change_type", "_commit_version")
+      .writeStream
+      .format("memory")
+      .queryName("cdc_stream_updates")
+      .outputMode("append")
+      .start()
+    try {
+      q.processAllAvailable()
+      checkAnswer(
+        spark.sql("SELECT * FROM cdc_stream_updates"),
+        Seq(
+          Row(1L, "Alice", CHANGE_TYPE_INSERT, 1L),
+          Row(1L, "Alice", CHANGE_TYPE_UPDATE_PREIMAGE, 2L),
+          Row(1L, "Robert", CHANGE_TYPE_UPDATE_POSTIMAGE, 2L)))
+    } finally {
+      q.stop()
+    }
+  }
+
+  test("streaming with deduplicationMode=netChanges throws") {
+    val id = recreateWithRowVersion()
+    catalog.setChangelogProperties(id, ChangelogProperties(
+      containsIntermediateChanges = true,
+      rowIdNames = Seq("id"),
+      rowVersionName = Some("row_commit_version")))
+
+    val e = intercept[AnalysisException] {
+      spark.readStream
+        .option("startingVersion", "1")
+        .option("deduplicationMode", "netChanges")
+        .changes(fullTableName)
+        .queryExecution.analyzed
+    }
+    assert(e.getCondition == "INVALID_CDC_OPTION.STREAMING_NET_CHANGES_NOT_SUPPORTED",
+      s"Unexpected error: ${e.getMessage}")
+  }
+
+  // The streaming row-level rewrite injects a streaming Aggregate, which is only
+  // semantically valid with Append output mode (Update / Complete would re-emit
+  // per-batch updates or the entire result table per batch, neither of which matches
+  // batch CDC semantics). UnsupportedOperationChecker now rejects those modes.
+
+  test("streaming row-level post-processing with update output mode is rejected") {
+    val id = recreateWithRowVersion()
+    catalog.setChangelogProperties(id, ChangelogProperties(
+      containsCarryoverRows = true,
+      rowIdNames = Seq("id"),
+      rowVersionName = Some("row_commit_version")))
+    catalog.addChangeRows(id, Seq(
+      ppRow(1L, "Alice", 1L, CHANGE_TYPE_INSERT, 1L, 1000000L)))
+
+    val e = intercept[AnalysisException] {
+      spark.readStream
+        .option("startingVersion", "1")
+        .changes(fullTableName)
+        .writeStream
+        .format("memory")
+        .queryName("cdc_stream_update_rejected")
+        .outputMode("update")
+        .start()
+    }
+    assert(e.getCondition == "STREAMING_OUTPUT_MODE.UNSUPPORTED_OPERATION",
+      s"Unexpected error: ${e.getMessage}")
+    assert(e.getMessage.contains("Change Data Capture"),
+      s"Error should mention CDC: ${e.getMessage}")
+  }
+
+  test("streaming row-level post-processing with complete output mode is rejected") {
+    val id = recreateWithRowVersion()
+    catalog.setChangelogProperties(id, ChangelogProperties(
+      containsCarryoverRows = true,
+      rowIdNames = Seq("id"),
+      rowVersionName = Some("row_commit_version")))
+    catalog.addChangeRows(id, Seq(
+      ppRow(1L, "Alice", 1L, CHANGE_TYPE_INSERT, 1L, 1000000L)))
+
+    val e = intercept[AnalysisException] {
+      spark.readStream
+        .option("startingVersion", "1")
+        .changes(fullTableName)
+        .writeStream
+        .format("memory")
+        .queryName("cdc_stream_complete_rejected")
+        .outputMode("complete")
+        .start()
+    }
+    assert(e.getCondition == "STREAMING_OUTPUT_MODE.UNSUPPORTED_OPERATION",
+      s"Unexpected error: ${e.getMessage}")
+    assert(e.getMessage.contains("Change Data Capture"),
+      s"Error should mention CDC: ${e.getMessage}")
+  }
+
+  test("streaming row-level rewrite raises on NULL _commit_timestamp") {
+    val id = recreateWithRowVersion()
+    catalog.setChangelogProperties(id, ChangelogProperties(
+      containsCarryoverRows = true,
+      rowIdNames = Seq("id"),
+      rowVersionName = Some("row_commit_version")))
+
+    // Insert a row with NULL _commit_timestamp (last column).
+    val row = InternalRow(
+      1L, UTF8String.fromString("Alice"), 1L,
+      UTF8String.fromString(CHANGE_TYPE_INSERT), 1L, null)
+    catalog.addChangeRows(id, Seq(row))
+
+    val q = spark.readStream
+      .option("startingVersion", "1")
+      .changes(fullTableName)
+      .writeStream
+      .format("memory")
+      .queryName("cdc_stream_null_ts")
+      .outputMode("append")
+      .start()
+    try {
+      val e = intercept[org.apache.spark.sql.streaming.StreamingQueryException] {
+        q.processAllAvailable()
+      }
+      // The CHANGELOG_CONTRACT_VIOLATION runtime error wraps the message; it should
+      // mention NULL_COMMIT_TIMESTAMP somewhere in the chain.
+      assert(e.getMessage.contains("NULL_COMMIT_TIMESTAMP") ||
+        Option(e.getCause).map(_.getMessage).getOrElse("").contains("NULL_COMMIT_TIMESTAMP"),
+        s"Expected NULL_COMMIT_TIMESTAMP in the error chain. Got: ${e.getMessage}")
+    } finally {
+      q.stop()
+    }
   }
 }

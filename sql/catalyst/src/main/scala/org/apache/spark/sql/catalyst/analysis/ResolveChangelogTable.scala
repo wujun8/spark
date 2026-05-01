@@ -17,21 +17,28 @@
 
 package org.apache.spark.sql.catalyst.analysis
 
+import java.util.UUID
+
+import org.apache.spark.SparkRuntimeException
+import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.aggregate.{
+  CollectList,
   Count,
   First,
   Last,
   Max,
   Min
 }
+import org.apache.spark.sql.catalyst.expressions.codegen.CodegenFallback
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.catalyst.streaming.StreamingRelationV2
 import org.apache.spark.sql.connector.catalog.{Changelog, ChangelogInfo}
 import org.apache.spark.sql.errors.QueryCompilationErrors
 import org.apache.spark.sql.execution.datasources.v2.{ChangelogTable, DataSourceV2Relation}
-import org.apache.spark.sql.types.{IntegerType, StringType}
+import org.apache.spark.sql.types.{BooleanType, DataType, IntegerType, MetadataBuilder, StringType}
+import org.apache.spark.unsafe.types.CalendarInterval
 
 /**
  * Post-processes a resolved [[ChangelogTable]] read to apply CDC option semantics
@@ -47,10 +54,17 @@ import org.apache.spark.sql.types.{IntegerType, StringType}
  *     carry-over pairs (same rowVersion on both sides) and the subsequent Project relabels
  *     real delete+insert pairs as update_preimage / update_postimage. Net change
  *     computation runs on top of that, collapsing intermediate states per `rowId`.
- *   - Streaming: post-processing is not yet supported. If the requested options would
- *     require any post-processing, the rule throws an explicit [[AnalysisException]] to
- *     prevent silent wrong results. Streams that don't require post-processing pass
- *     through unchanged.
+ *   - Streaming: row-level passes (carry-over removal and update detection) are supported
+ *     by rewriting the same logic in streaming-allowed primitives -- an
+ *     [[EventTimeWatermark]] on `_commit_timestamp`, a stateful [[Aggregate]] keyed by
+ *     `(rowId, _commit_version, _commit_timestamp)` that buffers events into an array, an
+ *     optional [[Filter]] for carry-over removal, a [[Generate]] using `Inline` to
+ *     re-emit the buffered events as rows, and an optional relabel [[Project]] for
+ *     update detection. Net change computation requires partitioning by `rowId` only and
+ *     reasoning over the entire requested range, which is fundamentally cross-batch and
+ *     not yet supported -- if `deduplicationMode = netChanges` is requested on a stream,
+ *     the rule throws an explicit [[AnalysisException]] to prevent silent wrong results.
+ *     Streams that don't require any post-processing pass through unchanged.
  */
 object ResolveChangelogTable extends Rule[LogicalPlan] {
 
@@ -64,8 +78,11 @@ object ResolveChangelogTable extends Rule[LogicalPlan] {
     final val MinRv = "__spark_cdc_min_rv"
     final val MaxRv = "__spark_cdc_max_rv"
     final val RvCnt = "__spark_cdc_rv_cnt"
+    // Streaming-only: array of struct buffering all input rows for one (rowId,
+    // _commit_version) group, fed into Generate(Inline(...)) to re-emit per-row.
+    final val Events = "__spark_cdc_events"
 
-    val all: Set[String] = Set(DelCnt, InsCnt, MinRv, MaxRv, RvCnt)
+    val all: Set[String] = Set(DelCnt, InsCnt, MinRv, MaxRv, RvCnt, Events)
   }
 
   /**
@@ -109,16 +126,21 @@ object ResolveChangelogTable extends Rule[LogicalPlan] {
 
     case rel @ StreamingRelationV2(_, _, table: ChangelogTable, _, _, _, _, _, _)
         if !table.resolved =>
-      // Streaming CDC reads do not yet apply post-processing. Run the same option /
-      // capability validation as the batch path so silent wrong results are impossible:
-      // either no post-processing would be required (fall through, return raw stream),
-      // or we throw an explicit AnalysisException.
       val changelog = table.changelog
       val req = evaluateRequirements(changelog, table.changelogInfo)
-      if (req.needsAny) {
-        throw QueryCompilationErrors.cdcStreamingPostProcessingNotSupported(changelog.name())
+      // Net-change computation partitions by `rowId` alone (without `_commit_version`) and
+      // reasons over the entire requested range, which is fundamentally cross-batch.
+      // Reject with an explicit error until a streaming-friendly implementation lands.
+      if (req.requiresNetChanges) {
+        throw QueryCompilationErrors.cdcStreamingNetChangesNotSupported(changelog.name())
       }
-      rel.copy(table = table.copy(resolved = true))
+      val resolvedRel = rel.copy(table = table.copy(resolved = true))
+      if (req.requiresCarryOverRemoval || req.requiresUpdateDetection) {
+        addStreamingRowLevelPostProcessing(
+          resolvedRel, changelog, req.requiresCarryOverRemoval, req.requiresUpdateDetection)
+      } else {
+        resolvedRel
+      }
   }
 
   // ---------------------------------------------------------------------------
@@ -195,6 +217,255 @@ object ResolveChangelogTable extends Rule[LogicalPlan] {
     if (requiresCarryOverRemoval) modifiedPlan = addCarryOverPairFilter(modifiedPlan)
     if (requiresUpdateDetection) modifiedPlan = addUpdateRelabelProjection(modifiedPlan)
     removeHelperColumns(modifiedPlan)
+  }
+
+  /**
+   * Streaming counterpart of [[addRowLevelPostProcessing]].
+   *
+   * ==Why a different shape from the batch path?==
+   *
+   * The batch rewrite is Window-based:
+   * {{{
+   *   DataSourceV2Relation
+   *     -> Window partitioned by (rowId..., _commit_version)
+   *     -> [Filter (carry-over)]
+   *     -> [Project (update relabel)]
+   *     -> Project (drop helper columns)
+   * }}}
+   * [[org.apache.spark.sql.catalyst.analysis.UnsupportedOperationChecker]] rejects
+   * `Window` on streaming queries (`NON_TIME_WINDOW_NOT_SUPPORTED_IN_STREAMING`).
+   * Replacing it with a plain [[Aggregate]] is not enough on its own: an aggregate
+   * collapses each group to a single row, losing the per-input rows we still need to
+   * relabel/filter; and an append-mode streaming aggregate without an event-time
+   * watermark on a grouping key is itself rejected by the checker.
+   *
+   * ==The rewritten plan==
+   *
+   * Two adjustments over the naive substitution: (a) inject an [[EventTimeWatermark]]
+   * on `_commit_timestamp` (zero delay) so the aggregate is legal in append mode, and
+   * (b) buffer every input row of a group as `Inline`-able structs and re-explode after
+   * the aggregate so no rows are lost.
+   * {{{
+   *   DataSourceV2Relation
+   *     -> Filter (RaiseError on NULL _commit_timestamp)
+   *     -> EventTimeWatermark(_commit_timestamp, 0s)
+   *     -> Aggregate
+   *          group by (rowId..., _commit_version, _commit_timestamp)
+   *          aggs    : _del_cnt, _ins_cnt
+   *                    [, _min_rv, _max_rv, _rv_cnt  (carry-over removal only)]
+   *                    , __spark_cdc_events = collect_list(struct(*))
+   *     -> [Filter (carry-over: _del_cnt=1 AND _ins_cnt=1
+   *                             AND _rv_cnt=2 AND _min_rv=_max_rv)]
+   *     -> Generate(Inline(__spark_cdc_events))   // re-emit one row per buffered input
+   *     -> [Project (update relabel)]
+   *     -> Project (drop helper columns)
+   *     -> Project (strip internal EventTimeWatermark metadata)
+   * }}}
+   *
+   * ==Runtime walkthrough==
+   *
+   * Append-mode streaming aggregates emit a group when its event-time grouping key
+   * falls at or below the global watermark (eviction predicate `eventTime <= watermark`,
+   * applied at the start of the next micro-batch). Suppose three commits with
+   * `_commit_timestamp` 10, 20, 30 each arrive in their own micro-batch:
+   * {{{
+   *   batch  max _ts seen  watermark after batch  groups emitted by this batch
+   *   -----  ------------  ---------------------  ----------------------------
+   *     1         10                10            <none>
+   *     2         20                20            groups with _commit_timestamp == 10
+   *     3         30                30            groups with _commit_timestamp == 20
+   *   end-of-stream final flush                   groups with _commit_timestamp == 30
+   * }}}
+   * Because every row of a single commit shares the same `_commit_timestamp` (CDC
+   * contract), advancing past commit T releases every group whose grouping
+   * `_commit_timestamp` equals T -- one commit's worth of post-processed output per
+   * micro-batch, with the final commit flushed on stream termination.
+   *
+   * ==Per-operator detail==
+   *
+   *  0. [[Filter]] guarding against NULL `_commit_timestamp` -- raises
+   *     `CHANGELOG_CONTRACT_VIOLATION.NULL_COMMIT_TIMESTAMP` for any row that
+   *     violates the contract. A NULL would never satisfy the downstream Aggregate's
+   *     `eventTime <= watermark` eviction predicate (NULL is silent in MAX, never
+   *     compares less-than-or-equal), so its group would be held in state forever.
+   *     Failing fast surfaces the connector bug instead of producing no output.
+   *  1. [[EventTimeWatermark]] on `_commit_timestamp` (zero delay) -- required so the
+   *     downstream stateful aggregate can emit groups in append output mode. By CDC
+   *     contract every row in a single commit shares `_commit_timestamp`, so taking it
+   *     as event time is safe.
+   *  2. [[Aggregate]] keyed by `(rowId..., _commit_version, _commit_timestamp)`. Computes
+   *     the same `_del_cnt` / `_ins_cnt` / (`_min_rv` / `_max_rv` / `_rv_cnt`) helpers as
+   *     the batch path, plus an `__spark_cdc_events` array-of-struct buffering every
+   *     input row of the group. `_commit_timestamp` is included in the grouping keys
+   *     (besides being a no-op given the contract) to satisfy
+   *     [[org.apache.spark.sql.catalyst.analysis.UnsupportedOperationChecker]]'s
+   *     requirement that the watermark attribute appear among grouping expressions for
+   *     append-mode streaming aggregations.
+   *  3. [[Filter]] (only when carry-over removal is requested) on the same predicate as
+   *     the batch path -- groups with `_del_cnt = 1 AND _ins_cnt = 1 AND _rv_cnt = 2 AND
+   *     _min_rv = _max_rv` are dropped wholesale.
+   *  4. [[Generate]] using `Inline(events)` to re-emit one output row per buffered input
+   *     row. `unrequiredChildIndex` drops the duplicate grouping columns and the events
+   *     buffer; the helper count columns flow through.
+   *  5. [[Project]] (only when update detection is requested) applying the same
+   *     `CHANGELOG_CONTRACT_VIOLATION.UNEXPECTED_MULTIPLE_CHANGES_PER_ROW_VERSION`
+   *     guard and `_change_type` relabel as the batch path.
+   *  6. [[Project]] (via [[removeHelperColumns]]) drops `__spark_cdc_*` helpers so
+   *     the output schema matches the connector's declared schema.
+   *  7. Final [[Project]] (via [[stripCommitTimestampWatermarkMetadata]]) clears the
+   *     `EventTimeWatermark.delayKey` from the user-visible `_commit_timestamp`
+   *     attribute so a downstream user-supplied `withWatermark` on a different column
+   *     does not interact with our internal watermark via the global multi-watermark
+   *     policy.
+   */
+  private def addStreamingRowLevelPostProcessing(
+      plan: LogicalPlan,
+      cl: Changelog,
+      requiresCarryOverRemoval: Boolean,
+      requiresUpdateDetection: Boolean): LogicalPlan = {
+    // Fail fast on a NULL `_commit_timestamp`. The downstream Aggregate uses it as
+    // both an event-time watermark column and a grouping key; a NULL group-key value
+    // would never satisfy the `eventTime <= watermark` eviction predicate, so the
+    // group would silently stall (held in state until end of stream). Mirrors the
+    // runtime check in [[CdcNetChangesStatefulProcessor]] -- fail fast at the
+    // contract violation rather than producing no output.
+    val plan1 = addNullCommitTimestampGuard(plan)
+    val rawCommitTsAttr = getAttribute(plan1, "_commit_timestamp")
+    val watermarked = EventTimeWatermark(
+      UUID.randomUUID(), rawCommitTsAttr, new CalendarInterval(0, 0, 0L), plan1)
+
+    val rowIdExprs = V2ExpressionUtils.resolveRefs[NamedExpression](
+      cl.rowId().toSeq, watermarked)
+    val commitVersionAttr = getAttribute(watermarked, "_commit_version")
+    // Pick up the post-watermark `_commit_timestamp` attribute -- it carries the
+    // EventTimeWatermark.delayKey metadata that UnsupportedOperationChecker scans for.
+    val commitTimestampAttr = getAttribute(watermarked, "_commit_timestamp")
+    val changeTypeAttr = getAttribute(watermarked, "_change_type")
+
+    val groupingExprs: Seq[Expression] =
+      rowIdExprs ++ Seq(commitVersionAttr, commitTimestampAttr)
+    val groupingNamedExprs: Seq[NamedExpression] =
+      groupingExprs.map(_.asInstanceOf[NamedExpression])
+
+    val insertIf = If(EqualTo(changeTypeAttr, Literal(Changelog.CHANGE_TYPE_INSERT)),
+      Literal(1), Literal(null, IntegerType))
+    val deleteIf = If(EqualTo(changeTypeAttr, Literal(Changelog.CHANGE_TYPE_DELETE)),
+      Literal(1), Literal(null, IntegerType))
+    val delCntAlias = Alias(
+      Count(Seq(deleteIf)).toAggregateExpression(), HelperColumn.DelCnt)()
+    val insCntAlias = Alias(
+      Count(Seq(insertIf)).toAggregateExpression(), HelperColumn.InsCnt)()
+
+    val rvAliases = if (requiresCarryOverRemoval) {
+      val rowVersionExpr = V2ExpressionUtils.resolveRef[NamedExpression](
+        cl.rowVersion(), watermarked)
+      Seq(
+        Alias(Min(rowVersionExpr).toAggregateExpression(), HelperColumn.MinRv)(),
+        Alias(Max(rowVersionExpr).toAggregateExpression(), HelperColumn.MaxRv)(),
+        Alias(Count(Seq(rowVersionExpr)).toAggregateExpression(), HelperColumn.RvCnt)())
+    } else Seq.empty
+
+    // Buffer every input row as a struct so Inline can re-emit them after the aggregate.
+    // The grouping-key columns (rowId..., `_commit_version`, `_commit_timestamp`) appear
+    // both inside the struct and as top-level grouping outputs; the top-level duplicates
+    // are dropped via `unrequiredChildIndex` below.
+    val structOfAllCols = CreateStruct(watermarked.output)
+    val eventsAlias = Alias(
+      new CollectList(structOfAllCols).toAggregateExpression(), HelperColumn.Events)()
+
+    val aggregateExprs: Seq[NamedExpression] =
+      groupingNamedExprs ++ Seq(delCntAlias, insCntAlias) ++ rvAliases :+ eventsAlias
+    val aggregated = Aggregate(groupingExprs, aggregateExprs, watermarked)
+
+    val filtered: LogicalPlan = if (requiresCarryOverRemoval) {
+      val delCnt = getAttribute(aggregated, HelperColumn.DelCnt)
+      val insCnt = getAttribute(aggregated, HelperColumn.InsCnt)
+      val minRv = getAttribute(aggregated, HelperColumn.MinRv)
+      val maxRv = getAttribute(aggregated, HelperColumn.MaxRv)
+      val rvCnt = getAttribute(aggregated, HelperColumn.RvCnt)
+      val isCarryoverPair = And(
+        And(EqualTo(delCnt, Literal(1L)), EqualTo(insCnt, Literal(1L))),
+        And(EqualTo(rvCnt, Literal(2L)), EqualTo(minRv, maxRv)))
+      Filter(Not(isCarryoverPair), aggregated)
+    } else aggregated
+
+    // Inline the struct array back into rows. Drop the events column (consumed by Inline)
+    // and the grouping-key columns (re-emitted from inside the struct) so the final shape
+    // matches the connector's schema plus the surviving helper count columns.
+    val eventsAttr = getAttribute(filtered, HelperColumn.Events)
+    val groupingAttrSet = AttributeSet(groupingNamedExprs.map(_.toAttribute))
+    val unrequiredChildIndex: Seq[Int] = filtered.output.zipWithIndex.collect {
+      case (a, i) if a.exprId == eventsAttr.exprId => i
+      case (a, i) if groupingAttrSet.contains(a) => i
+    }
+    val generatorOutput: Seq[Attribute] = watermarked.output.map { col =>
+      AttributeReference(col.name, col.dataType, col.nullable, col.metadata)()
+    }
+    val generated = Generate(
+      Inline(eventsAttr),
+      unrequiredChildIndex = unrequiredChildIndex,
+      outer = false,
+      qualifier = None,
+      generatorOutput = generatorOutput,
+      child = filtered)
+
+    val withRelabel: LogicalPlan = if (requiresUpdateDetection) {
+      addUpdateRelabelProjection(generated)
+    } else generated
+
+    // Strip the auto-injected EventTimeWatermark metadata from the user-visible
+    // `_commit_timestamp` so it does not interact with downstream user-supplied
+    // watermarks via the global multi-watermark policy. The metadata flows through
+    // Generate(Inline) (which copies attribute metadata) and the relabel Project, so
+    // it must be cleared here at the boundary of the rewrite.
+    val cleaned = stripCommitTimestampWatermarkMetadata(withRelabel)
+    removeHelperColumns(cleaned)
+  }
+
+  /**
+   * Adds a `Filter` that raises
+   * `CHANGELOG_CONTRACT_VIOLATION.NULL_COMMIT_TIMESTAMP` for any input row whose
+   * `_commit_timestamp` is `NULL`. Used as the first step of the streaming row-level
+   * rewrite so a contract-violating connector fails fast instead of silently stalling
+   * the downstream stateful aggregate's group.
+   */
+  private def addNullCommitTimestampGuard(input: LogicalPlan): LogicalPlan = {
+    val commitTsAttr = getAttribute(input, "_commit_timestamp")
+    // Use a dedicated, side-effecting catalyst expression rather than a
+    // `CaseWhen(IsNull(c) -> RaiseError, true)` predicate. Spark's
+    // `NullPropagation` rule rewrites `IsNull(c)` to `false` whenever `c.nullable`
+    // is `false` and similarly eliminates `AssertNotNull(c)` for non-nullable `c`
+    // (`expressions.scala:920-926`). A connector can reasonably declare
+    // `_commit_timestamp` as non-nullable in its schema while still emitting NULL
+    // at runtime in violation of the contract -- under those rules the guard
+    // would be optimized away and the runtime NULL would silently stall the
+    // group. `CdcAssertCommitTimestampNotNull` is unrecognised by
+    // `NullPropagation` and stays in the plan regardless of the column's
+    // declared nullability, surfacing the violation immediately.
+    Filter(CdcAssertCommitTimestampNotNull(commitTsAttr), input)
+  }
+
+  /**
+   * Final boundary for the streaming row-level rewrite: rebuilds the user-visible
+   * `_commit_timestamp` attribute with empty watermark-related metadata. Other
+   * attributes flow through unchanged.
+   */
+  private def stripCommitTimestampWatermarkMetadata(input: LogicalPlan): LogicalPlan = {
+    val projectList: Seq[NamedExpression] = input.output.map { attr =>
+      if (attr.name == "_commit_timestamp" &&
+          attr.metadata.contains(EventTimeWatermark.delayKey)) {
+        val cleanedMetadata = new MetadataBuilder()
+          .withMetadata(attr.metadata)
+          .remove(EventTimeWatermark.delayKey)
+          .build()
+        Alias(attr.withMetadata(cleanedMetadata), attr.name)(
+          exprId = attr.exprId,
+          qualifier = attr.qualifier)
+      } else {
+        attr
+      }
+    }
+    Project(projectList, input)
   }
 
   /**
@@ -508,4 +779,40 @@ object ResolveChangelogTable extends Rule[LogicalPlan] {
       throw new IllegalStateException(
         s"Required column '$name' not found in plan output: " +
           plan.output.map(_.name).mkString(", ")))
+}
+
+/**
+ * Side-effecting Boolean expression: returns `true` if the child is non-NULL and throws
+ * `CHANGELOG_CONTRACT_VIOLATION.NULL_COMMIT_TIMESTAMP` if the child is NULL. Used as the
+ * predicate of the streaming row-level rewrite's NULL guard `Filter`.
+ *
+ * The point of this dedicated expression is to remain in the plan no matter what the
+ * connector declares for `_commit_timestamp.nullable`: Spark's `NullPropagation` rules
+ * (`Optimizer.scala`'s `expressions.scala:920-926`) rewrite `IsNull(c) -> false` and
+ * eliminate `AssertNotNull(c)` whenever `c.nullable` is `false`. A connector that
+ * declares `_commit_timestamp` non-nullable but emits NULL at runtime would slip past
+ * those simpler shapes; this class is unrecognised by `NullPropagation` so the runtime
+ * check stays put.
+ */
+case class CdcAssertCommitTimestampNotNull(child: Expression)
+    extends UnaryExpression
+    with CodegenFallback
+    with NonSQLExpression {
+
+  override def dataType: DataType = BooleanType
+  override def foldable: Boolean = false
+  override def nullable: Boolean = false
+
+  override def eval(input: InternalRow): Any = {
+    if (child.eval(input) == null) {
+      throw new SparkRuntimeException(
+        errorClass = "CHANGELOG_CONTRACT_VIOLATION.NULL_COMMIT_TIMESTAMP",
+        messageParameters = Map.empty)
+    }
+    true
+  }
+
+  override protected def withNewChildInternal(
+      newChild: Expression): CdcAssertCommitTimestampNotNull =
+    copy(child = newChild)
 }
