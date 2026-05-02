@@ -29,7 +29,7 @@ import org.apache.spark.sql.connector.expressions.{FieldReference, NamedReferenc
 import org.apache.spark.sql.connector.read.ScanBuilder
 import org.apache.spark.sql.execution.datasources.v2.{ChangelogTable, DataSourceV2Relation}
 import org.apache.spark.sql.test.SharedSparkSession
-import org.apache.spark.sql.types.{IntegerType, LongType, StringType, TimestampType}
+import org.apache.spark.sql.types.{ArrayType, IntegerType, LongType, MapType, StringType, StructField, StructType, TimestampType}
 import org.apache.spark.sql.util.CaseInsensitiveStringMap
 
 /**
@@ -282,7 +282,8 @@ class ChangelogResolutionSuite extends SharedSparkSession {
     assertStreamingRowLevelRewrite(analyzed)
   }
 
-  test("DataStreamReader - changes() with deduplicationMode=netChanges throws") {
+  test("DataStreamReader - changes() with deduplicationMode=netChanges rewrites plan") {
+    import org.apache.spark.sql.catalyst.plans.logical.TransformWithState
     val ident = recreatePostProcessingTable()
     val cat = spark.sessionState.catalogManager
       .catalog(cdcCatalogName)
@@ -292,15 +293,13 @@ class ChangelogResolutionSuite extends SharedSparkSession {
       rowIdNames = Seq("id"),
       rowVersionName = Some("row_commit_version")))
 
-    checkError(
-      intercept[AnalysisException] {
-        spark.readStream
-          .option("deduplicationMode", "netChanges")
-          .changes(s"$cdcCatalogName.test_table")
-          .queryExecution.analyzed
-      },
-      condition = "INVALID_CDC_OPTION.STREAMING_NET_CHANGES_NOT_SUPPORTED",
-      parameters = Map("changelogName" -> s"$cdcCatalogName.test_table_changelog"))
+    val analyzed = spark.readStream
+      .option("deduplicationMode", "netChanges")
+      .changes(s"$cdcCatalogName.test_table")
+      .queryExecution.analyzed
+    val tws = analyzed.collect { case t: TransformWithState => t }
+    assert(tws.size == 1,
+      s"Expected exactly one TransformWithState; found ${tws.size}. Plan:\n$analyzed")
   }
 
   // ===========================================================================
@@ -381,11 +380,28 @@ class ChangelogResolutionSuite extends SharedSparkSession {
       parameters = wrongType("_commit_timestamp", "TIMESTAMP", "BIGINT"))
   }
 
-  test("ChangelogTable - _commit_version type is connector-defined (any type accepted)") {
-    Seq(IntegerType, LongType, StringType).foreach { versionType =>
+  test("ChangelogTable - _commit_version accepts any atomic orderable type") {
+    Seq(LongType, IntegerType, StringType, TimestampType).foreach { versionType =>
       ChangelogTable(
         cl("any_cl", validChangeType, "_commit_version" -> versionType, validTimestamp),
         stubInfo())
+    }
+  }
+
+  test("ChangelogTable - non-atomic _commit_version data type throws") {
+    val structVersion = StructType(Seq(StructField("v", LongType)))
+    Seq[(org.apache.spark.sql.types.DataType, String)](
+      ArrayType(LongType) -> "ARRAY<BIGINT>",
+      MapType(StringType, LongType) -> "MAP<STRING, BIGINT>",
+      structVersion -> structVersion.sql).foreach { case (versionType, sql) =>
+      checkError(
+        intercept[AnalysisException] {
+          ChangelogTable(
+            cl("bad_cl", validChangeType, "_commit_version" -> versionType, validTimestamp),
+            stubInfo())
+        },
+        condition = "INVALID_CHANGELOG_SCHEMA.INVALID_COLUMN_TYPE",
+        parameters = wrongType("_commit_version", "an atomic orderable type", sql))
     }
   }
 
